@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Backend
+backend/uploads/
+backend/config.json
+backend/chat_logs/
+backend/thinking_logs/
+
+# Config / personal
+config/agent_context.md
+config/prompts.json
+config/prompts.json.template
+config/prompts2.json
+config/prompts_custom_2.json
+
+# Generated output
+results_duplicates*.json
+results_duplicates*.txt
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build output
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
