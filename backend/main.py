@@ -35,7 +35,7 @@ import asyncio
 import os
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
@@ -310,8 +310,6 @@ class ChatRequest(BaseModel):
     video_fps: float = 2.0
     # Context injection from left pane
     pane_context: Optional[str] = None
-    # Save thinking text to disk
-    save_thinking: bool = False
     # Agentic tool use
     tools_enabled: bool = False
 
@@ -926,7 +924,7 @@ def _save_thinking_from_response(full_text: str):
 
 
 @app.post("/api/chat")
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(request: ChatRequest, http_request: Request):
     """Streaming chat endpoint"""
     config = load_config()
     prompts = load_prompts()
@@ -936,17 +934,24 @@ async def chat_endpoint(request: ChatRequest):
             # Build messages for API
             api_messages = []
             
-            # Determine system prompt: use chat_assistant prompt from config,
-            # fall back to interaction mode builder, then user-provided
+            # Determine system prompt based on interaction mode:
+            # - Free-form: use chat_assistant.system_prompt directly
+            # - Roleplay:  use roleplay.system_prompt (falls back to request.system_prompt, then chat_assistant)
+            # - Analytical: use request.system_prompt or chat_assistant fallback
             chat_system = prompts.get("chat_assistant", {}).get("system_prompt", "")
-            
+            roleplay_system = prompts.get("roleplay", {}).get("system_prompt", "")
+
             if not request.messages or request.messages[0].role != "system":
                 if chat_system and request.interaction_mode == "Free-form":
                     api_messages.append({"role": "system", "content": chat_system})
                 else:
+                    if request.interaction_mode == "Roleplay":
+                        resolved_prompt = roleplay_system or request.system_prompt or chat_system
+                    else:
+                        resolved_prompt = request.system_prompt or chat_system
                     system_msg = build_system_message(
                         request.interaction_mode,
-                        request.system_prompt or chat_system,
+                        resolved_prompt,
                         request.thought_syntax,
                         request.inject_thinking,
                         request.custom_mode
@@ -1069,8 +1074,7 @@ async def chat_endpoint(request: ChatRequest):
                     # No tool calls — model produced a final text response
                     if message.get("content"):
                         yield f"data: {json.dumps({'content': message['content']})}\n\n"
-                        if request.save_thinking:
-                            _save_thinking_from_response(message["content"])
+                        _save_thinking_from_response(message["content"])
                     yield f"data: [DONE]\n\n"
                     return  # exit generate()
 
@@ -1081,36 +1085,63 @@ async def chat_endpoint(request: ChatRequest):
 
             # --- Standard streaming path (no tools) ---
             payload = {**base_payload, "messages": api_messages, "stream": True}
-            response = requests.post(
-                config["api_url"],
-                json=payload,
-                stream=True,
-                timeout=600
+
+            loop = asyncio.get_event_loop()
+            vllm_response = await loop.run_in_executor(
+                None,
+                lambda: requests.post(config["api_url"], json=payload, stream=True, timeout=600)
             )
-            response.raise_for_status()
+            vllm_response.raise_for_status()
+
+            # Feed blocking iter_lines() into an asyncio queue from a background thread
+            line_queue: asyncio.Queue = asyncio.Queue()
+
+            def _stream_lines():
+                try:
+                    for line in vllm_response.iter_lines():
+                        loop.call_soon_threadsafe(line_queue.put_nowait, line)
+                except Exception:
+                    pass
+                finally:
+                    loop.call_soon_threadsafe(line_queue.put_nowait, None)  # sentinel
+
+            import threading
+            threading.Thread(target=_stream_lines, daemon=True).start()
 
             accumulated = []
-            for line in response.iter_lines():
-                if line:
-                    decoded = line.decode('utf-8')
-                    if decoded.startswith('data: '):
-                        decoded = decoded[6:]
-                    if decoded == '[DONE]':
-                        if request.save_thinking and accumulated:
-                            _save_thinking_from_response("".join(accumulated))
-                        yield f"data: [DONE]\n\n"
+            try:
+                while True:
+                    if await http_request.is_disconnected():
                         break
                     try:
-                        chunk = json.loads(decoded)
-                        if 'choices' in chunk and len(chunk['choices']) > 0:
-                            content = chunk['choices'][0].get('delta', {}).get('content', '')
-                            if content:
-                                if request.save_thinking:
-                                    accumulated.append(content)
-                                yield f"data: {json.dumps({'content': content})}\n\n"
-                    except json.JSONDecodeError:
+                        line = await asyncio.wait_for(line_queue.get(), timeout=0.05)
+                    except asyncio.TimeoutError:
                         continue
-        
+                    if line is None:
+                        break
+                    if line:
+                        decoded = line.decode('utf-8') if isinstance(line, bytes) else line
+                        if decoded.startswith('data: '):
+                            decoded = decoded[6:]
+                        if decoded == '[DONE]':
+                            if accumulated:
+                                _save_thinking_from_response("".join(accumulated))
+                            yield f"data: [DONE]\n\n"
+                            break
+                        try:
+                            chunk = json.loads(decoded)
+                            if 'choices' in chunk and len(chunk['choices']) > 0:
+                                content = chunk['choices'][0].get('delta', {}).get('content', '')
+                                if content:
+                                    accumulated.append(content)
+                                    yield f"data: {json.dumps({'content': content})}\n\n"
+                        except json.JSONDecodeError:
+                            continue
+            except GeneratorExit:
+                pass
+            finally:
+                vllm_response.close()  # drops TCP connection → vLLM aborts the request
+
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
     
@@ -1174,6 +1205,43 @@ async def scan_captions(directory: str = Query(...)):
     }
 
 
+@app.get("/api/captions/batch-scan")
+async def batch_scan_captions(directory: str = Query(...)):
+    """Recursively scan subdirectories for images, grouped by subdirectory."""
+    root = Path(directory).expanduser().resolve()
+    if not root.is_dir():
+        raise HTTPException(status_code=404, detail=f"Directory not found: {directory}")
+
+    # Collect all dirs that contain images (root + all subdirs)
+    all_dirs = sorted([root] + [d for d in root.rglob("*") if d.is_dir()])
+    subdirs = []
+    for d in all_dirs:
+        pairs = []
+        for f in sorted(d.iterdir()):
+            if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS:
+                caption_path = f.with_suffix(".txt")
+                pairs.append({
+                    "image_path": str(f),
+                    "caption_path": str(caption_path),
+                    "filename": f.name,
+                    "has_caption": caption_path.exists(),
+                })
+        if pairs:
+            rel = str(d.relative_to(root)) if d != root else "."
+            subdirs.append({
+                "dir": str(d),
+                "rel_dir": rel,
+                "images": pairs,
+                "total": len(pairs),
+            })
+
+    return {
+        "subdirs": subdirs,
+        "total_subdirs": len(subdirs),
+        "total_images": sum(s["total"] for s in subdirs),
+    }
+
+
 @app.get("/api/captions/image")
 async def get_caption_image(path: str = Query(...)):
     """Serve an image file for the caption reviewer."""
@@ -1192,6 +1260,125 @@ async def save_caption(request: SaveCaptionRequest):
     caption_path.parent.mkdir(parents=True, exist_ok=True)
     caption_path.write_text(request.caption.strip(), encoding="utf-8")
     return {"status": "saved", "path": str(caption_path)}
+
+
+class RecaptionRequest(BaseModel):
+    image_path: str
+    existing_caption: str = ""
+    extra_instruction: str = ""
+    max_tokens: int = 4096
+    temperature: float = 1.0
+    top_p: float = 0.95
+    top_k: int = 20
+    presence_penalty: float = 1.5
+    enable_thinking: bool = True
+    strip_thinking: bool = True
+
+
+class RotateImageRequest(BaseModel):
+    image_path: str
+    degrees: int  # positive = CCW (PIL convention): 90=CCW, -90=CW, 180=flip
+
+
+@app.post("/api/captions/rotate")
+async def rotate_image(request: RotateImageRequest):
+    """Rotate an image in-place and save it back to disk."""
+    path = Path(request.image_path)
+    if not path.exists() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+        raise HTTPException(status_code=404, detail="Image not found")
+    img = Image.open(path)
+    rotated = img.rotate(request.degrees, expand=True)
+    rotated.save(path)
+    return {"status": "rotated", "path": str(path)}
+
+
+class DeleteCaptionRequest(BaseModel):
+    caption_path: str
+    image_path: str
+
+
+@app.delete("/api/captions/delete")
+async def delete_caption(request: DeleteCaptionRequest):
+    """Delete a caption .txt file and its associated image."""
+    deleted = []
+    for path_str in (request.caption_path, request.image_path):
+        p = Path(path_str)
+        if p.exists():
+            p.unlink()
+            deleted.append(path_str)
+    return {"status": "deleted", "deleted": deleted}
+
+
+@app.post("/api/captions/rerun")
+async def rerun_caption(req: RecaptionRequest):
+    """Re-caption a single image using the current model, optionally with existing caption context
+    and extra instructions. Streams the result as SSE."""
+    config = load_config()
+
+    def generate():
+        image_path = req.image_path
+        file_path = Path(image_path)
+        if not file_path.exists():
+            yield f"data: {json.dumps({'error': f'File not found: {image_path}'})}\n\n"
+            return
+
+        parts = []
+        if req.existing_caption.strip():
+            parts.append(f"Existing caption:\n{req.existing_caption.strip()}")
+        if req.extra_instruction.strip():
+            parts.append(req.extra_instruction.strip())
+        else:
+            parts.append("Review the image and write an improved, accurate caption.")
+        instruction = "\n\n".join(parts)
+
+        content = [
+            {"type": "image_url", "image_url": {"url": f"file://{image_path}"}},
+            {"type": "text", "text": instruction},
+        ]
+        payload = {
+            "model": config["model_name"],
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": req.max_tokens,
+            "temperature": req.temperature,
+            "top_p": req.top_p,
+            "top_k": req.top_k,
+            "presence_penalty": req.presence_penalty,
+            "stream": True,
+            "chat_template_kwargs": {"enable_thinking": req.enable_thinking},
+        }
+
+        try:
+            response = requests.post(config["api_url"], json=payload, stream=True, timeout=600)
+            response.raise_for_status()
+            accumulated = []
+            for line in response.iter_lines():
+                if line:
+                    decoded = line.decode("utf-8")
+                    if decoded.startswith("data: "):
+                        decoded = decoded[6:]
+                    if decoded == "[DONE]":
+                        full = "".join(accumulated)
+                        if req.strip_thinking:
+                            full, thinking = _strip_thinking_tags(full)
+                            if thinking:
+                                image_dir = file_path.parent
+                                thinking_dir = image_dir / "thinking_text"
+                                thinking_dir.mkdir(parents=True, exist_ok=True)
+                                (thinking_dir / f"{file_path.stem}_thinking.txt").write_text(thinking, encoding="utf-8")
+                        yield f"data: {json.dumps({'done': True, 'caption': full})}\n\n"
+                        break
+                    try:
+                        chunk = json.loads(decoded)
+                        token = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if token:
+                            accumulated.append(token)
+                            yield f"data: {json.dumps({'token': token})}\n\n"
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 # --- Chat Log Endpoints ---
@@ -1499,6 +1686,154 @@ async def batch_caption(req: BatchCaptionRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
+
+class BatchRecaptionRequest(BaseModel):
+    directory: str
+    extra_instruction: str = ""
+    skip_missing: bool = True       # skip images that have no existing .txt caption
+    overwrite: bool = True          # overwrite existing .txt files (always True for a re-pass)
+    max_tokens: int = 4096
+    temperature: float = 1.0
+    top_p: float = 0.95
+    top_k: int = 20
+    presence_penalty: float = 1.5
+    enable_thinking: bool = True
+    strip_thinking: bool = True
+
+
+_batch_recaption_stop_flag = False
+_batch_recaption_running = False
+
+
+@app.post("/api/batch/recaption/stop")
+async def batch_recaption_stop():
+    global _batch_recaption_stop_flag
+    _batch_recaption_stop_flag = True
+    return {"status": "stopping"}
+
+
+@app.get("/api/batch/recaption/status")
+async def batch_recaption_status():
+    return {"running": _batch_recaption_running}
+
+
+@app.post("/api/batch/recaption")
+async def batch_recaption(req: BatchRecaptionRequest):
+    """Stream a batch re-caption pass over all images in a directory.
+    Sends each image + its existing .txt caption to the model with optional extra instructions.
+    Overwrites .txt files with the new result."""
+    global _batch_recaption_stop_flag, _batch_recaption_running
+    _batch_recaption_stop_flag = False
+    _batch_recaption_running = True
+
+    config = load_config()
+    directory = Path(req.directory).expanduser().resolve()
+
+    async def generate():
+        global _batch_recaption_stop_flag, _batch_recaption_running
+        try:
+            if not directory.is_dir():
+                yield f"data: {json.dumps({'error': f'Directory not found: {req.directory}'})}\n\n"
+                return
+
+            image_files = sorted(f for f in directory.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS)
+            if not image_files:
+                yield f"data: {json.dumps({'error': 'No image files found'})}\n\n"
+                return
+
+            # Filter to only images with captions if skip_missing
+            if req.skip_missing:
+                image_files = [f for f in image_files if f.with_suffix(".txt").exists()]
+                if not image_files:
+                    yield f"data: {json.dumps({'error': 'No captioned images found (all missing .txt files)'})}\n\n"
+                    return
+
+            total = len(image_files)
+            completed = 0
+            skipped = 0
+            errors = 0
+
+            yield f"data: {json.dumps({'type': 'start', 'total': total})}\n\n"
+
+            for i, image_file in enumerate(image_files):
+                if _batch_recaption_stop_flag:
+                    yield f"data: {json.dumps({'type': 'stopped', 'completed': completed, 'total': total})}\n\n"
+                    break
+
+                caption_path = image_file.with_suffix(".txt")
+                existing_caption = ""
+                if caption_path.exists():
+                    existing_caption = caption_path.read_text(encoding="utf-8").strip()
+                elif req.skip_missing:
+                    skipped += 1
+                    yield f"data: {json.dumps({'type': 'skip', 'file': image_file.name, 'index': i, 'total': total})}\n\n"
+                    continue
+
+                yield f"data: {json.dumps({'type': 'processing', 'file': image_file.name, 'index': i, 'total': total})}\n\n"
+
+                try:
+                    parts = []
+                    if existing_caption:
+                        parts.append(f"Existing caption:\n{existing_caption}")
+                    if req.extra_instruction.strip():
+                        parts.append(req.extra_instruction.strip())
+                    else:
+                        parts.append("Review the image and write an improved, accurate caption.")
+                    instruction = "\n\n".join(parts)
+
+                    content = [
+                        {"type": "image_url", "image_url": {"url": f"file://{image_file}"}},
+                        {"type": "text", "text": instruction},
+                    ]
+                    payload = {
+                        "model": config["model_name"],
+                        "messages": [{"role": "user", "content": content}],
+                        "max_tokens": req.max_tokens,
+                        "temperature": req.temperature,
+                        "top_p": req.top_p,
+                        "top_k": req.top_k,
+                        "presence_penalty": req.presence_penalty,
+                        "stream": False,
+                        "chat_template_kwargs": {"enable_thinking": req.enable_thinking},
+                    }
+
+                    def _call():
+                        r = requests.post(config["api_url"], json=payload, timeout=600)
+                        r.raise_for_status()
+                        return r.json()["choices"][0]["message"]["content"].strip()
+
+                    result = await asyncio.to_thread(_call)
+
+                    if req.strip_thinking:
+                        result, thinking = _strip_thinking_tags(result)
+                        if thinking:
+                            thinking_dir = directory / "thinking_text"
+                            thinking_dir.mkdir(parents=True, exist_ok=True)
+                            (thinking_dir / f"{image_file.stem}_thinking.txt").write_text(thinking, encoding="utf-8")
+
+                    caption_path.write_text(result, encoding="utf-8")
+                    completed += 1
+                    yield f"data: {json.dumps({'type': 'done', 'file': image_file.name, 'index': i, 'total': total, 'completed': completed, 'caption_preview': result[:200]})}\n\n"
+
+                except Exception as e:
+                    errors += 1
+                    yield f"data: {json.dumps({'type': 'error', 'file': image_file.name, 'index': i, 'error': str(e)})}\n\n"
+
+                await asyncio.sleep(0.1)
+
+            yield f"data: {json.dumps({'type': 'complete', 'completed': completed, 'skipped': skipped, 'errors': errors, 'total': total})}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        finally:
+            _batch_recaption_running = False
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
 
 import uvicorn
 if __name__ == "__main__":

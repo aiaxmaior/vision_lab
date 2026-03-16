@@ -55,7 +55,7 @@ sleep 2
 # Start frontend
 echo "🚀 Starting frontend server on port 5173..."
 cd "$SCRIPT_DIR/frontend"
-npm run dev &
+npm run dev -- --host &
 FRONTEND_PID=$!
 
 echo ""

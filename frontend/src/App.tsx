@@ -29,7 +29,7 @@ import {
   Upload, Settings, Cpu, MessageSquare, Send, Trash2,
   ChevronDown, ChevronRight, RefreshCw, Paperclip, X,
   Scissors, Check, Zap, Eye, Brain, Film, Camera,
-  FolderOpen, Save, ChevronLeft, FileText, ImageIcon, Download, RotateCcw, EyeOff
+  FolderOpen, Save, ChevronLeft, FileText, ImageIcon, Download, RotateCcw, RotateCw, EyeOff
 } from 'lucide-react';
 
 interface Message {
@@ -66,6 +66,13 @@ interface CaptionPair {
   filename: string;
   caption: string;
   has_caption: boolean;
+}
+
+interface BatchSubdir {
+  dir: string;
+  rel_dir: string;
+  images: CaptionPair[];
+  total: number;
 }
 
 interface TokenEstimate {
@@ -170,11 +177,11 @@ function App() {
   const [connectionStatus, setConnectionStatus] = useState<'connected' | 'offline'>('offline');
 
   // Tab state - left pane functions (chat is always visible on right)
-  const [activeTab, setActiveTab] = useState<'captions' | 'batch' | 'prompts'>('batch');
+  const [activeTab, setActiveTab] = useState<'captions' | 'batch' | 'prompts' | 'batch-review'>('batch');
   const [enablePaneContext, setEnablePaneContext] = useState(false);
   const [enableThinking, setEnableThinking] = useState(true);
   const [enableTools, setEnableTools] = useState(false);
-  const [saveThinking, setSaveThinking] = useState(false);
+  const [showThinking, setShowThinking] = useState(false);
   const [showCaptionPreview, setShowCaptionPreview] = useState(true);
 
   // Prompt Manager state
@@ -208,6 +215,24 @@ function App() {
   const [captionEdit, setCaptionEdit] = useState('');
   const [captionSaveStatus, setCaptionSaveStatus] = useState('');
   const [captionLoading, setCaptionLoading] = useState(false);
+  const [rerunInstruction, setRerunInstruction] = useState('');
+  const [rerunning, setRerunning] = useState(false);
+  const [repassDir, setRepassDir] = useState('');
+  const [repassInstruction, setRepassInstruction] = useState('');
+  const [repassRunning, setRepassRunning] = useState(false);
+  const [repassLog, setRepassLog] = useState<BatchLogEntry[]>([]);
+  const [repassProgress, setRepassProgress] = useState({ completed: 0, total: 0, skipped: 0, errors: 0 });
+  const [repassSkipMissing, setRepassSkipMissing] = useState(true);
+
+  // Batch review state
+  const [batchReviewDir, setBatchReviewDir] = useState('');
+  const [batchReviewSubdirs, setBatchReviewSubdirs] = useState<BatchSubdir[]>([]);
+  const [batchReviewLoading, setBatchReviewLoading] = useState(false);
+  const [batchReviewStatus, setBatchReviewStatus] = useState('');
+  const [batchReviewVersions, setBatchReviewVersions] = useState<Record<string, number>>({});
+
+  // Caption reviewer image version (for cache-busting after rotate)
+  const [captionImageVersion, setCaptionImageVersion] = useState(0);
 
   // Panel collapse states
   const [panels, setPanels] = useState({
@@ -222,6 +247,8 @@ function App() {
   // Resizable sidebar
   const [sidebarWidth, setSidebarWidth] = useState(380);
   const [isResizing, setIsResizing] = useState(false);
+  const [functionPaneWidth, setFunctionPaneWidth] = useState(500);
+  const [isPaneResizing, setIsPaneResizing] = useState(false);
 
   // Refs
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -259,6 +286,36 @@ function App() {
     };
   }, [isResizing, handleMouseMove, handleMouseUp]);
 
+  // Function pane / chat pane resize handlers
+  const handlePaneMouseDown = useCallback(() => {
+    setIsPaneResizing(true);
+  }, []);
+
+  const handlePaneMouseMove = useCallback((e: MouseEvent) => {
+    if (!isPaneResizing) return;
+    const newWidth = Math.max(200, Math.min(900, e.clientX - sidebarWidth - 6));
+    setFunctionPaneWidth(newWidth);
+  }, [isPaneResizing, sidebarWidth]);
+
+  const handlePaneMouseUp = useCallback(() => {
+    setIsPaneResizing(false);
+  }, []);
+
+  useEffect(() => {
+    if (isPaneResizing) {
+      document.addEventListener('mousemove', handlePaneMouseMove);
+      document.addEventListener('mouseup', handlePaneMouseUp);
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+    }
+    return () => {
+      document.removeEventListener('mousemove', handlePaneMouseMove);
+      document.removeEventListener('mouseup', handlePaneMouseUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, [isPaneResizing, handlePaneMouseMove, handlePaneMouseUp]);
+
   // Scroll to bottom on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -281,22 +338,13 @@ function App() {
 
   const fetchConfig = async (): Promise<Config> => {
     try {
-      const [configRes, promptsRes] = await Promise.all([
-        fetch('/api/config'),
-        fetch('/api/prompts'),
-      ]);
+      const configRes = await fetch('/api/config');
       let merged = DEFAULT_CONFIG;
       if (configRes.ok) {
         const data = await configRes.json();
         merged = { ...DEFAULT_CONFIG, ...data };
       }
-      if (promptsRes.ok) {
-        const prompts = await promptsRes.json();
-        const chatPrompt = prompts?.chat_assistant?.system_prompt || '';
-        if (!merged.system_prompt && chatPrompt) {
-          merged = { ...merged, system_prompt: chatPrompt };
-        }
-      }
+      // System prompt is sourced from prompt config (Prompts tab), not settings
       setConfig(merged);
       return merged;
     } catch {
@@ -435,7 +483,7 @@ function App() {
           video_fps: config.target_fps,
           pane_context: getPaneContext() || undefined,
           tools_enabled: enableTools,
-          save_thinking: saveThinking
+          save_thinking: true
         }),
         signal: abortControllerRef.current.signal
       });
@@ -694,6 +742,57 @@ function App() {
     setCaptionSaveStatus('');
   };
 
+  const rerunCaption = async () => {
+    if (captionPairs.length === 0 || rerunning) return;
+    const pair = captionPairs[captionIndex];
+    setRerunning(true);
+    setCaptionSaveStatus('');
+    setCaptionEdit('');
+    let accumulated = '';
+    try {
+      const res = await fetch('/api/captions/rerun', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          image_path: pair.image_path,
+          existing_caption: pair.caption,
+          extra_instruction: rerunInstruction,
+        })
+      });
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const payload = line.slice(6).trim();
+          if (!payload) continue;
+          try {
+            const msg = JSON.parse(payload);
+            if (msg.token) {
+              accumulated += msg.token;
+              setCaptionEdit(accumulated);
+            } else if (msg.done) {
+              setCaptionEdit(msg.caption);
+              accumulated = msg.caption;
+            } else if (msg.error) {
+              setCaptionSaveStatus(`Error: ${msg.error}`);
+            }
+          } catch { /* ignore */ }
+        }
+      }
+    } catch (e) {
+      setCaptionSaveStatus('Re-caption failed');
+    } finally {
+      setRerunning(false);
+    }
+  };
+
   const saveCaptionEdit = async () => {
     if (captionPairs.length === 0) return;
     const pair = captionPairs[captionIndex];
@@ -714,6 +813,167 @@ function App() {
     } catch {
       setCaptionSaveStatus('Save failed');
     }
+  };
+
+  const deleteCaption = async () => {
+    if (captionPairs.length === 0) return;
+    const pair = captionPairs[captionIndex];
+    try {
+      const res = await fetch('/api/captions/delete', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ caption_path: pair.caption_path, image_path: pair.image_path })
+      });
+      if (res.ok) {
+        setCaptionPairs(prev => {
+          const updated = [...prev];
+          updated.splice(captionIndex, 1);
+          return updated;
+        });
+        setCaptionIndex(prev => Math.max(0, Math.min(prev, captionPairs.length - 2)));
+        setCaptionEdit('');
+        setCaptionSaveStatus('Deleted ✓');
+      }
+    } catch {
+      setCaptionSaveStatus('Delete failed');
+    }
+  };
+
+  // --- Batch Review Functions ---
+
+  const loadBatchReview = async (dir: string) => {
+    if (!dir.trim()) return;
+    setBatchReviewLoading(true);
+    setBatchReviewStatus('');
+    setBatchReviewSubdirs([]);
+    try {
+      const res = await fetch(`/api/captions/batch-scan?directory=${encodeURIComponent(dir)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setBatchReviewSubdirs(data.subdirs);
+        setBatchReviewStatus(`${data.total_images} images in ${data.total_subdirs} folder${data.total_subdirs !== 1 ? 's' : ''}`);
+      } else {
+        setBatchReviewStatus('Directory not found');
+      }
+    } catch {
+      setBatchReviewStatus('Load failed');
+    } finally {
+      setBatchReviewLoading(false);
+    }
+  };
+
+  const deleteBatchImage = async (subdirIdx: number, imgIdx: number) => {
+    const subdir = batchReviewSubdirs[subdirIdx];
+    const img = subdir.images[imgIdx];
+    try {
+      const res = await fetch('/api/captions/delete', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_path: img.image_path, caption_path: img.caption_path })
+      });
+      if (res.ok) {
+        setBatchReviewSubdirs(prev => {
+          const updated = [...prev];
+          const updatedImages = [...updated[subdirIdx].images];
+          updatedImages.splice(imgIdx, 1);
+          if (updatedImages.length === 0) {
+            updated.splice(subdirIdx, 1);
+          } else {
+            updated[subdirIdx] = { ...updated[subdirIdx], images: updatedImages, total: updatedImages.length };
+          }
+          return updated;
+        });
+      }
+    } catch {
+      // silent fail — image stays in grid
+    }
+  };
+
+  const rotateBatchImage = async (subdirIdx: number, imgIdx: number, degrees: number) => {
+    const img = batchReviewSubdirs[subdirIdx].images[imgIdx];
+    try {
+      const res = await fetch('/api/captions/rotate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_path: img.image_path, degrees })
+      });
+      if (res.ok) {
+        setBatchReviewVersions(prev => ({ ...prev, [img.image_path]: (prev[img.image_path] || 0) + 1 }));
+      }
+    } catch { /* silent */ }
+  };
+
+  const rotateCaptionImage = async (degrees: number) => {
+    if (!currentPair) return;
+    try {
+      const res = await fetch('/api/captions/rotate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image_path: currentPair.image_path, degrees })
+      });
+      if (res.ok) setCaptionImageVersion(prev => prev + 1);
+    } catch { /* silent */ }
+  };
+
+  // --- Batch Re-caption Functions ---
+
+  const startRepass = async () => {
+    if (!repassDir.trim() || repassRunning) return;
+    setRepassRunning(true);
+    setRepassLog([]);
+    setRepassProgress({ completed: 0, total: 0, skipped: 0, errors: 0 });
+    try {
+      const res = await fetch('/api/batch/recaption', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          directory: repassDir,
+          extra_instruction: repassInstruction,
+          skip_missing: repassSkipMissing,
+          max_tokens: config.max_tokens,
+          temperature: config.temperature,
+          top_p: config.top_p,
+          top_k: config.top_k,
+          presence_penalty: config.presence_penalty,
+          enable_thinking: enableThinking,
+          strip_thinking: true,
+        }),
+      });
+      const reader = res.body?.getReader();
+      if (!reader) return;
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value);
+        for (const line of chunk.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const entry: BatchLogEntry = JSON.parse(line.slice(6));
+            setRepassLog(prev => [...prev, entry]);
+            if (entry.type === 'start') {
+              setRepassProgress(p => ({ ...p, total: entry.total || 0 }));
+            } else if (entry.type === 'done') {
+              setRepassProgress(p => ({ ...p, completed: entry.completed || p.completed + 1 }));
+            } else if (entry.type === 'skip') {
+              setRepassProgress(p => ({ ...p, skipped: p.skipped + 1 }));
+            } else if (entry.type === 'error') {
+              setRepassProgress(p => ({ ...p, errors: p.errors + 1 }));
+            } else if (entry.type === 'complete' || entry.type === 'stopped') {
+              setRepassRunning(false);
+            }
+          } catch { /* skip parse errors */ }
+        }
+      }
+    } catch (e) {
+      setRepassLog(prev => [...prev, { type: 'error', error: String(e) }]);
+    } finally {
+      setRepassRunning(false);
+    }
+  };
+
+  const stopRepass = async () => {
+    try { await fetch('/api/batch/recaption/stop', { method: 'POST' }); } catch { /* ignore */ }
   };
 
   // --- Batch Captioner Functions ---
@@ -904,15 +1164,17 @@ function App() {
   };
 
   const captureScreenshot = async () => {
-    if (!functionPaneRef.current) return;
     try {
-      const canvas = await html2canvas(functionPaneRef.current, {
-        backgroundColor: '#0a0b0f',
-        scale: 1.5,
-        logging: false,
-        useCORS: true,
-        allowTaint: true,
-      });
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const track = stream.getVideoTracks()[0];
+      const imageCapture = new ImageCapture(track);
+      const bitmap = await imageCapture.grabFrame();
+      track.stop();
+
+      const canvas = document.createElement('canvas');
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      canvas.getContext('2d')!.drawImage(bitmap, 0, 0);
       const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
       setPendingScreenshot(dataUrl);
     } catch (e) {
@@ -928,6 +1190,7 @@ function App() {
     withCaptions: captionPairs.filter(p => p.has_caption).length,
     charCount: captionEdit.length,
     wordCount: captionEdit.trim() ? captionEdit.trim().split(/\s+/).length : 0,
+    tokenCount: Math.ceil(captionEdit.length / 4),
   };
 
   const togglePanel = (panel: keyof typeof panels) => {
@@ -997,7 +1260,7 @@ function App() {
   };
 
   return (
-    <div className={`app-container ${isResizing ? 'resizing' : ''}`}>
+    <div className={`app-container ${isResizing || isPaneResizing ? 'resizing' : ''}`}>
       {/* Sidebar */}
       <aside className="sidebar" style={{ width: sidebarWidth, minWidth: sidebarWidth }}>
         <div className="sidebar-header">
@@ -1274,41 +1537,6 @@ function App() {
                     </div>
                   </div>
 
-                  <div className="form-group">
-                    <label className="form-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <span>System Prompt</span>
-                      <button
-                        className="btn btn-secondary"
-                        style={{ padding: '2px 8px', fontSize: '0.7rem' }}
-                        onClick={async () => {
-                          try {
-                            const res = await fetch('/api/prompts');
-                            if (res.ok) {
-                              const p = await res.json();
-                              const defaultPrompt = p?.chat_assistant?.system_prompt || '';
-                              setConfig(c => ({ ...c, system_prompt: defaultPrompt }));
-                            }
-                          } catch { /* ignore */ }
-                        }}
-                        title="Reset to default from prompts.json"
-                      >
-                        <RotateCcw size={10} /> Reset
-                      </button>
-                    </label>
-                    <textarea
-                      className="form-input"
-                      rows={4}
-                      placeholder="Loaded from prompts.json → chat_assistant.system_prompt"
-                      value={config.system_prompt}
-                      onChange={(e) => setConfig(c => ({ ...c, system_prompt: e.target.value }))}
-                    />
-                    {config.system_prompt && (
-                      <p style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: 4 }}>
-                        {config.system_prompt.length} chars · This is sent as the system message to the VLM
-                      </p>
-                    )}
-                  </div>
-
                   <div className="row">
                     <label className={`form-checkbox ${config.inject_thinking_tags ? 'active' : ''}`}>
                       <input
@@ -1397,6 +1625,22 @@ function App() {
                         />
                         <span className="form-slider-value">{config.min_p.toFixed(2)}</span>
                       </div>
+                    </div>
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Top K</label>
+                    <div className="form-slider-container">
+                      <input
+                        type="range"
+                        className="form-slider"
+                        min="1"
+                        max="200"
+                        step="1"
+                        value={config.top_k}
+                        onChange={(e) => setConfig(c => ({ ...c, top_k: parseInt(e.target.value) }))}
+                      />
+                      <span className="form-slider-value">{config.top_k}</span>
                     </div>
                   </div>
 
@@ -1548,7 +1792,7 @@ function App() {
       {/* Main Content Area - Dual Pane */}
       <main className="main-content">
         {/* LEFT PANE: Function Tabs */}
-        <div className="function-pane" ref={functionPaneRef}>
+        <div className="function-pane" ref={functionPaneRef} style={{ width: functionPaneWidth, flex: 'none' }}>
           <div className="tab-bar">
             <button
               className={`tab-btn ${activeTab === 'batch' ? 'active' : ''}`}
@@ -1561,6 +1805,12 @@ function App() {
               onClick={() => setActiveTab('captions')}
             >
               <FileText size={16} /> Caption Review
+            </button>
+            <button
+              className={`tab-btn ${activeTab === 'batch-review' ? 'active' : ''}`}
+              onClick={() => setActiveTab('batch-review')}
+            >
+              <ImageIcon size={16} /> Batch Review
             </button>
             <button
               className={`tab-btn ${activeTab === 'prompts' ? 'active' : ''}`}
@@ -1619,6 +1869,15 @@ function App() {
                     onChange={(e) => setBatchInstruction(e.target.value)}
                   />
                 </div>
+                <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <input
+                    type="checkbox"
+                    id="batch-thinking"
+                    checked={enableThinking}
+                    onChange={(e) => setEnableThinking(e.target.checked)}
+                  />
+                  <label htmlFor="batch-thinking" className="form-label" style={{ margin: 0 }}>Enable Thinking</label>
+                </div>
                 <div className="row">
                   {!batchRunning ? (
                     <button className="btn btn-primary" style={{ flex: 1 }} onClick={startBatch} disabled={!batchDir.trim()}>
@@ -1665,6 +1924,90 @@ function App() {
                   <span style={{ marginLeft: 'auto', color: 'var(--text-muted)' }}>/ {batchProgress.total} total</span>
                 </div>
               )}
+
+              {/* Re-caption Pass */}
+              <div className="batch-repass-section">
+                <div className="batch-repass-header">
+                  <RefreshCw size={14} />
+                  <span>Re-caption Pass</span>
+                  <span className="batch-repass-hint">Runs each existing caption + image back through the model</span>
+                </div>
+                <div className="batch-config">
+                  <div className="form-group">
+                    <label className="form-label">Directory</label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      placeholder="/path/to/dataset/"
+                      value={repassDir}
+                      onChange={(e) => setRepassDir(e.target.value)}
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label className="form-label">Extra Instructions (optional)</label>
+                    <textarea
+                      className="form-input"
+                      rows={2}
+                      placeholder="e.g. 'Expand detail on lighting and composition. Keep under 120 words.'"
+                      value={repassInstruction}
+                      onChange={(e) => setRepassInstruction(e.target.value)}
+                    />
+                  </div>
+                  <div className="form-group" style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    <input
+                      type="checkbox"
+                      id="repass-skip-missing"
+                      checked={repassSkipMissing}
+                      onChange={(e) => setRepassSkipMissing(e.target.checked)}
+                    />
+                    <label htmlFor="repass-skip-missing" style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', cursor: 'pointer' }}>
+                      Skip images without existing captions
+                    </label>
+                  </div>
+                  <div className="row">
+                    {!repassRunning ? (
+                      <button className="btn btn-secondary" style={{ flex: 1 }} onClick={startRepass} disabled={!repassDir.trim()}>
+                        <RefreshCw size={16} /> Start Re-caption Pass
+                      </button>
+                    ) : (
+                      <button className="btn btn-danger" style={{ flex: 1 }} onClick={stopRepass}>
+                        <X size={16} /> Stop
+                      </button>
+                    )}
+                  </div>
+                  {repassProgress.total > 0 && (
+                    <div className="batch-progress-bar">
+                      <div
+                        className="batch-progress-bar-fill"
+                        style={{ width: `${((repassProgress.completed + repassProgress.skipped) / repassProgress.total) * 100}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
+                {repassLog.length > 0 && (
+                  <div className="batch-progress">
+                    {repassLog.map((entry, i) => (
+                      <div key={i} className={`batch-progress-item ${entry.type}`}>
+                        {entry.type === 'processing' && <><RefreshCw size={12} className="spinner" /> Re-captioning {entry.file}</>}
+                        {entry.type === 'done' && <><Check size={12} /> {entry.file}</>}
+                        {entry.type === 'skip' && <><ChevronRight size={12} /> {entry.file} (no caption, skipped)</>}
+                        {entry.type === 'error' && <><X size={12} /> {entry.file}: {entry.error}</>}
+                        {entry.type === 'start' && <><Zap size={12} /> Starting re-caption: {entry.total} images</>}
+                        {entry.type === 'complete' && <><Check size={12} /> Complete: {entry.completed} re-captioned, {entry.skipped} skipped, {entry.errors} errors</>}
+                        {entry.type === 'stopped' && <><X size={12} /> Stopped at {entry.completed}/{entry.total}</>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {repassProgress.total > 0 && (
+                  <div className="batch-summary">
+                    <span className="batch-summary-stat"><Check size={14} /> {repassProgress.completed}</span>
+                    <span className="batch-summary-stat"><ChevronRight size={14} /> {repassProgress.skipped} skipped</span>
+                    <span className="batch-summary-stat">{repassProgress.errors > 0 && <><X size={14} /> {repassProgress.errors} errors</>}</span>
+                    <span style={{ marginLeft: 'auto', color: 'var(--text-muted)' }}>/ {repassProgress.total} total</span>
+                  </div>
+                )}
+              </div>
             </div>
           ) : activeTab === 'captions' ? (
             /* Caption Review Tab */
@@ -1714,11 +2057,29 @@ function App() {
                   <div className="caption-review-image-panel">
                     {showCaptionPreview && (
                       <img
-                        src={`/api/captions/image?path=${encodeURIComponent(currentPair?.image_path || '')}`}
+                        src={`/api/captions/image?path=${encodeURIComponent(currentPair?.image_path || '')}&v=${captionImageVersion}`}
                         alt={currentPair?.filename || ''}
                         className="caption-review-image"
                       />
                     )}
+                    <div style={{ display: 'flex', gap: 6, marginBottom: 6 }}>
+                      <button
+                        className="btn btn-secondary"
+                        onClick={() => rotateCaptionImage(90)}
+                        title="Rotate 90° counter-clockwise"
+                        style={{ flex: 1, fontSize: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}
+                      >
+                        <RotateCcw size={13} /> CCW
+                      </button>
+                      <button
+                        className="btn btn-secondary"
+                        onClick={() => rotateCaptionImage(-90)}
+                        title="Rotate 90° clockwise"
+                        style={{ flex: 1, fontSize: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4 }}
+                      >
+                        <RotateCw size={13} /> CW
+                      </button>
+                    </div>
                     <button
                       className="btn btn-secondary"
                       onClick={() => setShowCaptionPreview(p => !p)}
@@ -1750,15 +2111,44 @@ function App() {
                       onChange={(e) => { setCaptionEdit(e.target.value); setCaptionSaveStatus(''); }}
                       placeholder="Enter caption text..."
                     />
+                    <div className="caption-rerun-row">
+                      <input
+                        type="text"
+                        className="form-input"
+                        placeholder="Extra instructions for re-caption (optional)..."
+                        value={rerunInstruction}
+                        onChange={(e) => setRerunInstruction(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') rerunCaption(); }}
+                        disabled={rerunning}
+                        style={{ flex: 1, fontSize: '0.8rem' }}
+                      />
+                      <button
+                        className={`btn btn-secondary ${rerunning ? 'loading' : ''}`}
+                        onClick={rerunCaption}
+                        disabled={rerunning}
+                        title="Re-caption this image using the current model"
+                      >
+                        <RefreshCw size={14} /> {rerunning ? 'Running…' : 'Re-caption'}
+                      </button>
+                    </div>
                     <div className="caption-review-edit-footer">
                       <div className="caption-review-counts">
                         <span>{captionStats.charCount} chars</span>
                         <span>~{captionStats.wordCount} words</span>
+                        <span>~{captionStats.tokenCount} tokens</span>
                       </div>
                       <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                         {captionSaveStatus && (
                           <span className="caption-save-status">{captionSaveStatus}</span>
                         )}
+                        <button
+                          className="btn btn-danger"
+                          onClick={deleteCaption}
+                          disabled={!currentPair}
+                          title="Delete image and caption file"
+                        >
+                          <Trash2 size={16} /> Delete
+                        </button>
                         <button className="btn btn-primary" onClick={saveCaptionEdit}>
                           <Save size={16} /> Save
                         </button>
@@ -1779,6 +2169,89 @@ function App() {
                   <button className="btn btn-secondary" onClick={() => navigateCaption(1)}>
                     Next <ChevronRight size={16} />
                   </button>
+                </div>
+              )}
+            </div>
+          ) : activeTab === 'batch-review' ? (
+            /* Batch Review Tab */
+            <div className="batch-review-panel">
+              <div className="batch-review-toolbar">
+                <input
+                  type="text"
+                  className="form-input"
+                  placeholder="Root directory (e.g., /path/to/dataset)"
+                  value={batchReviewDir}
+                  onChange={(e) => setBatchReviewDir(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') loadBatchReview(batchReviewDir); }}
+                  style={{ flex: 1 }}
+                />
+                <button
+                  className="btn btn-primary"
+                  onClick={() => loadBatchReview(batchReviewDir)}
+                  disabled={batchReviewLoading}
+                >
+                  <FolderOpen size={16} /> {batchReviewLoading ? 'Loading…' : 'Load'}
+                </button>
+              </div>
+              {batchReviewStatus && (
+                <div className="batch-review-stats">{batchReviewStatus}</div>
+              )}
+              {batchReviewSubdirs.length === 0 && !batchReviewLoading ? (
+                <div className="empty-state">
+                  <ImageIcon className="empty-state-icon" />
+                  <h3 className="empty-state-title">Batch Review</h3>
+                  <p className="empty-state-text">
+                    Enter a root directory to browse all images across subdirectories. Click delete to remove an image and its caption file.
+                  </p>
+                </div>
+              ) : (
+                <div className="batch-review-scroll">
+                  {batchReviewSubdirs.map((subdir, si) => (
+                    <div key={subdir.dir} className="batch-review-subdir">
+                      <div className="batch-review-subdir-header">
+                        <FolderOpen size={13} style={{ marginRight: 6, verticalAlign: 'middle' }} />
+                        {subdir.rel_dir}
+                        <span style={{ marginLeft: 8, opacity: 0.6 }}>({subdir.total})</span>
+                      </div>
+                      <div className="batch-review-grid">
+                        {subdir.images.map((img, ii) => (
+                          <div key={img.image_path} className="batch-review-card">
+                            <img
+                              src={`/api/captions/image?path=${encodeURIComponent(img.image_path)}&v=${batchReviewVersions[img.image_path] || 0}`}
+                              alt={img.filename}
+                              loading="lazy"
+                            />
+                            <div className="batch-review-card-footer">
+                              <span className="batch-review-card-name" title={img.filename}>
+                                {img.filename}
+                              </span>
+                              <button
+                                className="batch-review-card-btn"
+                                onClick={() => rotateBatchImage(si, ii, 90)}
+                                title="Rotate CCW"
+                              >
+                                <RotateCcw size={10} />
+                              </button>
+                              <button
+                                className="batch-review-card-btn"
+                                onClick={() => rotateBatchImage(si, ii, -90)}
+                                title="Rotate CW"
+                              >
+                                <RotateCw size={10} />
+                              </button>
+                              <button
+                                className="batch-review-card-delete"
+                                onClick={() => deleteBatchImage(si, ii)}
+                                title="Delete image and caption"
+                              >
+                                <Trash2 size={10} />
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
@@ -1888,6 +2361,12 @@ function App() {
           ) : null}
         </div>
 
+        {/* Pane Resize Handle */}
+        <div
+          className={`resize-handle ${isPaneResizing ? 'active' : ''}`}
+          onMouseDown={handlePaneMouseDown}
+        />
+
         {/* RIGHT PANE: Persistent Chat */}
         <div className="chat-pane">
           {/* Chat Header */}
@@ -1926,31 +2405,47 @@ function App() {
               messages.map((msg, i) => (
                 <div key={i} className={`message ${msg.role}`}>
                   <div className="message-content">
-                    {msg.role === 'assistant' ? (
-                      <ReactMarkdown
-                        components={{
-                          code({ className, children, ...props }) {
-                            const match = /language-(\w+)/.exec(className || '');
-                            const inline = !match;
-                            return !inline ? (
-                              <SyntaxHighlighter
-                                style={oneDark}
-                                language={match[1]}
-                                PreTag="div"
-                              >
-                                {String(children).replace(/\n$/, '')}
-                              </SyntaxHighlighter>
-                            ) : (
-                              <code className={className} {...props}>
-                                {children}
-                              </code>
-                            );
-                          }
-                        }}
-                      >
-                        {msg.content}
-                      </ReactMarkdown>
-                    ) : (
+                    {msg.role === 'assistant' ? (() => {
+                      const raw = msg.content || '';
+                      const thinkMatch = raw.match(/^([\s\S]*?<\/think>)([\s\S]*)$/i);
+                      const thinkBlock = thinkMatch ? thinkMatch[1] : null;
+                      const displayContent = thinkMatch ? thinkMatch[2].trim() : raw;
+                      return (
+                        <>
+                          {showThinking && thinkBlock && (
+                            <div className="thinking-block">
+                              <div className="thinking-block-header">
+                                <Brain size={12} /> Thinking
+                              </div>
+                              <div className="thinking-block-content">{thinkBlock.replace(/<\/?think>/gi, '').trim()}</div>
+                            </div>
+                          )}
+                          <ReactMarkdown
+                            components={{
+                              code({ className, children, ...props }) {
+                                const match = /language-(\w+)/.exec(className || '');
+                                const inline = !match;
+                                return !inline ? (
+                                  <SyntaxHighlighter
+                                    style={oneDark}
+                                    language={match[1]}
+                                    PreTag="div"
+                                  >
+                                    {String(children).replace(/\n$/, '')}
+                                  </SyntaxHighlighter>
+                                ) : (
+                                  <code className={className} {...props}>
+                                    {children}
+                                  </code>
+                                );
+                              }
+                            }}
+                          >
+                            {displayContent}
+                          </ReactMarkdown>
+                        </>
+                      );
+                    })() : (
                       msg.content
                     )}
                   </div>
@@ -2016,41 +2511,44 @@ function App() {
                 </div>
               )}
               <div className="chat-actions">
-                <button
-                  className={`context-toggle ${pendingScreenshot ? 'active' : ''}`}
-                  onClick={captureScreenshot}
-                  title="Capture left pane screenshot and attach to next message"
-                >
-                  <Camera size={12} /> Screenshot
-                </button>
-                <button
-                  className={`context-toggle ${enablePaneContext ? 'active' : ''}`}
-                  onClick={() => setEnablePaneContext(p => !p)}
-                  title="Include left pane context in chat messages"
-                >
-                  <Brain size={12} /> {enablePaneContext ? 'Context ON' : 'Context'}
-                </button>
-                <button
-                  className={`context-toggle ${enableThinking ? 'active' : ''}`}
-                  onClick={() => setEnableThinking(t => !t)}
-                  title="Toggle Qwen3.5 thinking mode"
-                >
-                  {enableThinking ? '🧠 Thinking' : '⚡ Instruct'}
-                </button>
-                <button
-                  className={`context-toggle ${enableTools ? 'active' : ''}`}
-                  onClick={() => setEnableTools(t => !t)}
-                  title="Enable agentic tool use (read/write files, list directories)"
-                >
-                  <Zap size={12} /> {enableTools ? 'Tools ON' : 'Tools'}
-                </button>
-                <button
-                  className={`context-toggle ${saveThinking ? 'active' : ''}`}
-                  onClick={() => setSaveThinking(t => !t)}
-                  title="Save thinking/reasoning text to disk (thinking_logs/)"
-                >
-                  <Save size={12} /> {saveThinking ? 'Save Think ON' : 'Save Think'}
-                </button>
+                <div className="chat-toggles">
+                  <button
+                    className={`context-toggle ${pendingScreenshot ? 'active' : ''}`}
+                    onClick={captureScreenshot}
+                    title="Capture left pane screenshot and attach to next message"
+                  >
+                    <Camera size={12} /> Screenshot
+                  </button>
+                  <button
+                    className={`context-toggle ${enablePaneContext ? 'active' : ''}`}
+                    onClick={() => setEnablePaneContext(p => !p)}
+                    title="Include left pane context in chat messages"
+                  >
+                    <Brain size={12} /> {enablePaneContext ? 'Context ON' : 'Context'}
+                  </button>
+                  <button
+                    className={`context-toggle ${enableThinking ? 'active' : ''}`}
+                    onClick={() => setEnableThinking(t => !t)}
+                    title="Toggle Qwen3.5 thinking mode"
+                  >
+                    {enableThinking ? '🧠 Thinking' : '⚡ Instruct'}
+                  </button>
+                  <button
+                    className={`context-toggle ${enableTools ? 'active' : ''}`}
+                    onClick={() => setEnableTools(t => !t)}
+                    title="Enable agentic tool use (read/write files, list directories)"
+                  >
+                    <Zap size={12} /> {enableTools ? 'Tools ON' : 'Tools'}
+                  </button>
+                  <button
+                    className={`context-toggle ${showThinking ? 'active' : ''}`}
+                    onClick={() => setShowThinking(t => !t)}
+                    title="Show thinking/reasoning text in chat messages"
+                  >
+                    <Brain size={12} /> {showThinking ? 'Thinking Visible' : 'Show Thinking'}
+                  </button>
+                </div>
+                <div className="chat-controls">
                 {media && media.id !== lastSentMedia && (
                   <div style={{
                     padding: '4px 8px',
@@ -2112,6 +2610,7 @@ function App() {
                     <Send size={16} /> Send
                   </button>
                 )}
+                </div>{/* end chat-controls */}
               </div>
             </div>
           </div>
