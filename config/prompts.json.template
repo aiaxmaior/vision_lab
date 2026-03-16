@@ -1,0 +1,146 @@
+{
+  "_version": "",
+  "_description": "",
+  "_agent_restriction": "",
+
+  "chat_assistant": {
+    "description": "",
+    "system_prompt": "",
+    "max_tokens": null
+  },
+
+  "batch_captioner": {
+    "description": "",
+    "image_instruction": "",
+    "video_instruction": "",
+    "max_tokens": null
+  },
+
+  "caption_targets": {
+    "_description": "",
+
+    "general": {
+      "name": "",
+      "description": "",
+      "token_limit": null,
+      "style": "",
+      "media_types": [],
+      "max_tokens": null,
+      "image_instruction": "",
+      "video_instruction": ""
+    },
+
+    "sdxl": {
+      "name": "",
+      "description": "",
+      "token_limit": null,
+      "style": "",
+      "media_types": [],
+      "max_tokens": null,
+      "image_instruction": "",
+      "video_instruction": null
+    },
+
+    "flux1d": {
+      "name": "",
+      "description": "",
+      "token_limit": null,
+      "style": "",
+      "media_types": [],
+      "max_tokens": null,
+      "image_instruction": "",
+      "video_instruction": null
+    },
+
+    "llm_te": {
+      "name": "",
+      "description": "",
+      "token_limit": null,
+      "style": "",
+      "media_types": [],
+      "max_tokens": null,
+      "image_instruction": "",
+      "video_instruction": null
+    },
+
+    "wan_video": {
+      "name": "",
+      "description": "",
+      "token_limit": null,
+      "style": "",
+      "media_types": [],
+      "max_tokens": null,
+      "image_instruction": null,
+      "video_instruction": ""
+    },
+
+    "ltx2": {
+      "name": "",
+      "description": "",
+      "token_limit": null,
+      "style": "",
+      "media_types": [],
+      "max_tokens": null,
+      "image_instruction": null,
+      "video_instruction": ""
+    },
+
+    "i2i_instruction": {
+      "name": "",
+      "description": "",
+      "token_limit": null,
+      "style": "",
+      "media_types": [],
+      "max_tokens": null,
+      "image_instruction": "",
+      "video_instruction": null
+    }
+  },
+
+  "refinement": {
+    "description": "",
+    "instruction_template": "",
+    "max_tokens": null
+  },
+
+  "sampling_presets": {
+    "thinking_mode": {
+      "description": "",
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "min_p": null,
+      "presence_penalty": null,
+      "repetition_penalty": null,
+      "enable_thinking": false
+    },
+    "instruct_mode": {
+      "description": "",
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "min_p": null,
+      "presence_penalty": null,
+      "repetition_penalty": null,
+      "enable_thinking": false
+    },
+    "captioning": {
+      "description": "",
+      "temperature": null,
+      "top_p": null,
+      "top_k": null,
+      "min_p": null,
+      "presence_penalty": null,
+      "repetition_penalty": null,
+      "enable_thinking": false
+    }
+  },
+
+  "context_budget": {
+    "_note": "",
+    "system_prompt_budget": null,
+    "max_response_tokens": null,
+    "prefix_cache_strategy": "",
+    "prefix_cache_strategy_description": ""
+  }
+}
