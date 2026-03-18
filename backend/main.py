@@ -39,7 +39,7 @@ from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
-from PIL import Image
+from PIL import Image, ImageOps
 import io
 import shutil
 import uuid
@@ -291,7 +291,7 @@ class ChatRequest(BaseModel):
     frequency_penalty: float = 0.0
     seed: int = -1
     # Qwen3.5 thinking mode
-    enable_thinking: bool = True
+    enable_thinking: bool = False
     # Mode settings
     interaction_mode: str = "Free-form"
     system_prompt: str = ""
@@ -308,6 +308,7 @@ class ChatRequest(BaseModel):
     image_width: int = 640
     image_height: int = 480
     video_fps: float = 2.0
+    force_fps: bool = True
     # Context injection from left pane
     pane_context: Optional[str] = None
     # Agentic tool use
@@ -323,8 +324,9 @@ class BatchCaptionRequest(BaseModel):
     top_p: float = 0.95
     top_k: int = 20
     presence_penalty: float = 1.5
-    enable_thinking: bool = True
+    enable_thinking: bool = False
     video_fps: float = 2.0
+    force_fps: bool = True
     strip_thinking: bool = True
     skip_existing: bool = True
     output_format: str = "json"
@@ -1010,13 +1012,13 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
                 "top_k": request.top_k,
                 "presence_penalty": request.presence_penalty,
                 "frequency_penalty": request.frequency_penalty,
-                "chat_template_kwargs": {"enable_thinking": request.enable_thinking},
             }
+            if request.enable_thinking:
+                base_payload["chat_template_kwargs"] = {"enable_thinking": True}
 
-            if request.include_media and request.media_path and is_video_file(request.media_path):
+            if request.include_media and request.media_path and is_video_file(request.media_path) and request.force_fps:
                 base_payload["mm_processor_kwargs"] = {
                     "fps": request.video_fps,
-                    "do_sample_frames": True,
                 }
 
             if request.seed >= 0:
@@ -1205,6 +1207,58 @@ async def scan_captions(directory: str = Query(...)):
     }
 
 
+@app.get("/api/captions/scan-dual")
+async def scan_captions_dual(
+    directory: str = Query(...),
+    subdir_a: str = Query(...),
+    subdir_b: str = Query(""),
+):
+    """Scan a base directory for images; resolve captions from two named subdirectories.
+
+    Images live in ``directory``.  Caption .txt files are expected at
+    ``directory/subdir_a/<stem>.txt`` and optionally ``directory/subdir_b/<stem>.txt``.
+    The save endpoint already creates parent dirs, so subdirs need not pre-exist.
+    """
+    dir_path = Path(directory).expanduser().resolve()
+    if not dir_path.is_dir():
+        raise HTTPException(status_code=404, detail=f"Directory not found: {directory}")
+
+    path_a = dir_path / subdir_a
+    path_b = dir_path / subdir_b if subdir_b else None
+
+    pairs = []
+    for f in sorted(dir_path.iterdir()):
+        if not (f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS):
+            continue
+        stem = f.stem
+
+        cap_a = path_a / f"{stem}.txt"
+        has_a = cap_a.exists()
+        caption_a = cap_a.read_text(encoding="utf-8").strip() if has_a else ""
+
+        cap_b = (path_b / f"{stem}.txt") if path_b else None
+        has_b = cap_b.exists() if cap_b else False
+        caption_b = cap_b.read_text(encoding="utf-8").strip() if has_b else ""
+
+        pairs.append({
+            "image_path": str(f),
+            "filename": f.name,
+            "caption_path_a": str(cap_a),
+            "caption_a": caption_a,
+            "has_caption_a": has_a,
+            "caption_path_b": str(cap_b) if cap_b else "",
+            "caption_b": caption_b,
+            "has_caption_b": has_b,
+        })
+
+    return {
+        "pairs": pairs,
+        "total": len(pairs),
+        "with_captions_a": sum(1 for p in pairs if p["has_caption_a"]),
+        "with_captions_b": sum(1 for p in pairs if p["has_caption_b"]),
+    }
+
+
 @app.get("/api/captions/batch-scan")
 async def batch_scan_captions(directory: str = Query(...)):
     """Recursively scan subdirectories for images, grouped by subdirectory."""
@@ -1271,7 +1325,7 @@ class RecaptionRequest(BaseModel):
     top_p: float = 0.95
     top_k: int = 20
     presence_penalty: float = 1.5
-    enable_thinking: bool = True
+    enable_thinking: bool = False
     strip_thinking: bool = True
 
 
@@ -1286,9 +1340,22 @@ async def rotate_image(request: RotateImageRequest):
     path = Path(request.image_path)
     if not path.exists() or path.suffix.lower() not in IMAGE_EXTENSIONS:
         raise HTTPException(status_code=404, detail="Image not found")
-    img = Image.open(path)
-    rotated = img.rotate(request.degrees, expand=True)
-    rotated.save(path)
+
+    with Image.open(path) as img:
+        fmt = img.format or path.suffix.lstrip(".").upper()
+        if fmt == "JPG":
+            fmt = "JPEG"
+        # Apply EXIF orientation first so rotations are visually correct
+        img = ImageOps.exif_transpose(img)
+        img.load()  # force full read into memory before overwriting the file
+        rotated = img.rotate(request.degrees, expand=True)
+
+    save_kwargs: dict = {"format": fmt}
+    if fmt == "JPEG":
+        save_kwargs["quality"] = 95
+        save_kwargs["subsampling"] = 0
+
+    rotated.save(path, **save_kwargs)
     return {"status": "rotated", "path": str(path)}
 
 
@@ -1344,8 +1411,9 @@ async def rerun_caption(req: RecaptionRequest):
             "top_k": req.top_k,
             "presence_penalty": req.presence_penalty,
             "stream": True,
-            "chat_template_kwargs": {"enable_thinking": req.enable_thinking},
         }
+        if req.enable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": True}
 
         try:
             response = requests.post(config["api_url"], json=payload, stream=True, timeout=600)
@@ -1559,13 +1627,13 @@ def _caption_single_file(file_path: str, instruction: str, config: dict,        
         "top_k": req.top_k,
         "presence_penalty": req.presence_penalty,
         "stream": False,
-        "chat_template_kwargs": {"enable_thinking": req.enable_thinking},
     }
+    if req.enable_thinking:
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
 
-    if is_video:
+    if is_video and req.force_fps:
         payload["mm_processor_kwargs"] = {
             "fps": req.video_fps,
-            "do_sample_frames": True,
         }
 
     response = requests.post(config["api_url"], json=payload, timeout=600)
@@ -1697,7 +1765,7 @@ class BatchRecaptionRequest(BaseModel):
     top_p: float = 0.95
     top_k: int = 20
     presence_penalty: float = 1.5
-    enable_thinking: bool = True
+    enable_thinking: bool = False
     strip_thinking: bool = True
 
 
@@ -1794,8 +1862,9 @@ async def batch_recaption(req: BatchRecaptionRequest):
                         "top_k": req.top_k,
                         "presence_penalty": req.presence_penalty,
                         "stream": False,
-                        "chat_template_kwargs": {"enable_thinking": req.enable_thinking},
                     }
+                    if req.enable_thinking:
+                        payload["chat_template_kwargs"] = {"enable_thinking": True}
 
                     def _call():
                         r = requests.post(config["api_url"], json=payload, timeout=600)

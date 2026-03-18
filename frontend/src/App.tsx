@@ -21,7 +21,6 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import html2canvas from 'html2canvas';
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
@@ -66,6 +65,17 @@ interface CaptionPair {
   filename: string;
   caption: string;
   has_caption: boolean;
+}
+
+interface DualCaptionPair {
+  image_path: string;
+  filename: string;
+  caption_path_a: string;
+  caption_a: string;
+  has_caption_a: boolean;
+  caption_path_b: string;
+  caption_b: string;
+  has_caption_b: boolean;
 }
 
 interface BatchSubdir {
@@ -179,7 +189,7 @@ function App() {
   // Tab state - left pane functions (chat is always visible on right)
   const [activeTab, setActiveTab] = useState<'captions' | 'batch' | 'prompts' | 'batch-review'>('batch');
   const [enablePaneContext, setEnablePaneContext] = useState(false);
-  const [enableThinking, setEnableThinking] = useState(true);
+  const [enableThinking, setEnableThinking] = useState(false);
   const [enableTools, setEnableTools] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
   const [showCaptionPreview, setShowCaptionPreview] = useState(true);
@@ -203,6 +213,8 @@ function App() {
   const [batchInstruction, setBatchInstruction] = useState('');
   const [captionTarget, setCaptionTarget] = useState('general');
   const [captionTargets, setCaptionTargets] = useState<{ id: string; name: string; description: string; style: string; token_limit: number | null; media_types: string[] }[]>([]);
+  const [chatForceFps, setChatForceFps] = useState(true);
+  const [batchForceFps, setBatchForceFps] = useState(true);
   const [batchRunning, setBatchRunning] = useState(false);
   const [batchLog, setBatchLog] = useState<BatchLogEntry[]>([]);
   const [batchProgress, setBatchProgress] = useState({ completed: 0, total: 0, skipped: 0, errors: 0 });
@@ -210,9 +222,12 @@ function App() {
 
   // Caption reviewer state
   const [captionDir, setCaptionDir] = useState('');
-  const [captionPairs, setCaptionPairs] = useState<CaptionPair[]>([]);
+  const [captionSubdirA, setCaptionSubdirA] = useState('pass1');
+  const [captionSubdirB, setCaptionSubdirB] = useState('pass2');
+  const [captionPairs, setCaptionPairs] = useState<DualCaptionPair[]>([]);
   const [captionIndex, setCaptionIndex] = useState(0);
-  const [captionEdit, setCaptionEdit] = useState('');
+  const [captionEditA, setCaptionEditA] = useState('');
+  const [captionEditB, setCaptionEditB] = useState('');
   const [captionSaveStatus, setCaptionSaveStatus] = useState('');
   const [captionLoading, setCaptionLoading] = useState(false);
   const [rerunInstruction, setRerunInstruction] = useState('');
@@ -230,6 +245,7 @@ function App() {
   const [batchReviewLoading, setBatchReviewLoading] = useState(false);
   const [batchReviewStatus, setBatchReviewStatus] = useState('');
   const [batchReviewVersions, setBatchReviewVersions] = useState<Record<string, number>>({});
+  const [batchReviewThumbSize, setBatchReviewThumbSize] = useState(180);
 
   // Caption reviewer image version (for cache-busting after rotate)
   const [captionImageVersion, setCaptionImageVersion] = useState(0);
@@ -481,6 +497,7 @@ function App() {
           image_width: config.image_width,
           image_height: config.image_height,
           video_fps: config.target_fps,
+          force_fps: chatForceFps,
           pane_context: getPaneContext() || undefined,
           tools_enabled: enableTools,
           save_thinking: true
@@ -717,18 +734,25 @@ function App() {
     setCaptionLoading(true);
     setCaptionSaveStatus('');
     try {
-      const res = await fetch(`/api/captions/scan?directory=${encodeURIComponent(dir)}`);
+      const params = new URLSearchParams({
+        directory: dir,
+        subdir_a: captionSubdirA || 'pass1',
+        subdir_b: captionSubdirB || '',
+      });
+      const res = await fetch(`/api/captions/scan-dual?${params}`);
       if (!res.ok) throw new Error('Directory not found');
       const data = await res.json();
       setCaptionPairs(data.pairs);
       setCaptionIndex(0);
       if (data.pairs.length > 0) {
-        setCaptionEdit(data.pairs[0].caption);
+        setCaptionEditA(data.pairs[0].caption_a);
+        setCaptionEditB(data.pairs[0].caption_b);
       }
     } catch (e) {
       setCaptionPairs([]);
       setCaptionIndex(0);
-      setCaptionEdit('');
+      setCaptionEditA('');
+      setCaptionEditB('');
     } finally {
       setCaptionLoading(false);
     }
@@ -738,16 +762,19 @@ function App() {
     if (captionPairs.length === 0) return;
     const newIndex = (captionIndex + direction + captionPairs.length) % captionPairs.length;
     setCaptionIndex(newIndex);
-    setCaptionEdit(captionPairs[newIndex].caption);
+    setCaptionEditA(captionPairs[newIndex].caption_a);
+    setCaptionEditB(captionPairs[newIndex].caption_b);
     setCaptionSaveStatus('');
   };
 
-  const rerunCaption = async () => {
+  const rerunCaption = async (slot: 'a' | 'b') => {
     if (captionPairs.length === 0 || rerunning) return;
     const pair = captionPairs[captionIndex];
+    const existingCaption = slot === 'a' ? captionEditA : captionEditB;
+    const setEdit = slot === 'a' ? setCaptionEditA : setCaptionEditB;
     setRerunning(true);
     setCaptionSaveStatus('');
-    setCaptionEdit('');
+    setEdit('');
     let accumulated = '';
     try {
       const res = await fetch('/api/captions/rerun', {
@@ -755,7 +782,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           image_path: pair.image_path,
-          existing_caption: pair.caption,
+          existing_caption: existingCaption,
           extra_instruction: rerunInstruction,
         })
       });
@@ -776,9 +803,9 @@ function App() {
             const msg = JSON.parse(payload);
             if (msg.token) {
               accumulated += msg.token;
-              setCaptionEdit(accumulated);
+              setEdit(accumulated);
             } else if (msg.done) {
-              setCaptionEdit(msg.caption);
+              setEdit(msg.caption);
               accumulated = msg.caption;
             } else if (msg.error) {
               setCaptionSaveStatus(`Error: ${msg.error}`);
@@ -793,20 +820,27 @@ function App() {
     }
   };
 
-  const saveCaptionEdit = async () => {
+  const saveCaptionSlot = async (slot: 'a' | 'b') => {
     if (captionPairs.length === 0) return;
     const pair = captionPairs[captionIndex];
+    const captionPath = slot === 'a' ? pair.caption_path_a : pair.caption_path_b;
+    const caption = slot === 'a' ? captionEditA : captionEditB;
+    if (!captionPath) return;
     try {
       const res = await fetch('/api/captions/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ caption_path: pair.caption_path, caption: captionEdit })
+        body: JSON.stringify({ caption_path: captionPath, caption })
       });
       if (res.ok) {
-        setCaptionSaveStatus('Saved ✓');
+        setCaptionSaveStatus(`${slot.toUpperCase()} saved ✓`);
         setCaptionPairs(prev => {
           const updated = [...prev];
-          updated[captionIndex] = { ...updated[captionIndex], caption: captionEdit.trim(), has_caption: true };
+          if (slot === 'a') {
+            updated[captionIndex] = { ...updated[captionIndex], caption_a: caption.trim(), has_caption_a: true };
+          } else {
+            updated[captionIndex] = { ...updated[captionIndex], caption_b: caption.trim(), has_caption_b: true };
+          }
           return updated;
         });
       }
@@ -818,11 +852,12 @@ function App() {
   const deleteCaption = async () => {
     if (captionPairs.length === 0) return;
     const pair = captionPairs[captionIndex];
+    // Delete the image; use caption_path_a as placeholder (backend deletes by image_path primarily)
     try {
       const res = await fetch('/api/captions/delete', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ caption_path: pair.caption_path, image_path: pair.image_path })
+        body: JSON.stringify({ caption_path: pair.caption_path_a, image_path: pair.image_path })
       });
       if (res.ok) {
         setCaptionPairs(prev => {
@@ -831,7 +866,8 @@ function App() {
           return updated;
         });
         setCaptionIndex(prev => Math.max(0, Math.min(prev, captionPairs.length - 2)));
-        setCaptionEdit('');
+        setCaptionEditA('');
+        setCaptionEditB('');
         setCaptionSaveStatus('Deleted ✓');
       }
     } catch {
@@ -999,6 +1035,7 @@ function App() {
           presence_penalty: config.presence_penalty,
           enable_thinking: enableThinking,
           video_fps: config.target_fps,
+          force_fps: batchForceFps,
           strip_thinking: true,
           skip_existing: true,
         }),
@@ -1158,7 +1195,7 @@ function App() {
       return `[Batch Captioner] Target: ${targetName}, Directory: ${batchDir || 'not set'}, Progress: ${completed}/${total} (${skipped} skipped, ${errors} errors), Status: ${batchRunning ? 'running' : 'idle'}${lastDone ? `, Last caption: "${lastDone.caption_preview?.slice(0, 100)}..."` : ''}`;
     }
     if (activeTab === 'captions' && currentPair) {
-      return `[Caption Reviewer] File: ${currentPair.filename} (${captionIndex + 1}/${captionPairs.length}), Has caption: ${currentPair.has_caption}, Current edit: "${captionEdit.slice(0, 200)}${captionEdit.length > 200 ? '...' : ''}"`;
+      return `[Caption Reviewer] File: ${currentPair.filename} (${captionIndex + 1}/${captionPairs.length}), A: ${currentPair.has_caption_a ? 'captioned' : 'missing'}, B: ${currentPair.has_caption_b ? 'captioned' : 'missing'}`;
     }
     return '';
   };
@@ -1168,7 +1205,7 @@ function App() {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
       const track = stream.getVideoTracks()[0];
       const imageCapture = new ImageCapture(track);
-      const bitmap = await imageCapture.grabFrame();
+      const bitmap = await (imageCapture as any).grabFrame();
       track.stop();
 
       const canvas = document.createElement('canvas');
@@ -1187,10 +1224,18 @@ function App() {
   const currentPair = captionPairs[captionIndex] || null;
   const captionStats = {
     total: captionPairs.length,
-    withCaptions: captionPairs.filter(p => p.has_caption).length,
-    charCount: captionEdit.length,
-    wordCount: captionEdit.trim() ? captionEdit.trim().split(/\s+/).length : 0,
-    tokenCount: Math.ceil(captionEdit.length / 4),
+    withCaptionsA: captionPairs.filter(p => p.has_caption_a).length,
+    withCaptionsB: captionPairs.filter(p => p.has_caption_b).length,
+    slotA: {
+      charCount: captionEditA.length,
+      wordCount: captionEditA.trim() ? captionEditA.trim().split(/\s+/).length : 0,
+      tokenCount: Math.ceil(captionEditA.length / 4),
+    },
+    slotB: {
+      charCount: captionEditB.length,
+      wordCount: captionEditB.trim() ? captionEditB.trim().split(/\s+/).length : 0,
+      tokenCount: Math.ceil(captionEditB.length / 4),
+    },
   };
 
   const togglePanel = (panel: keyof typeof panels) => {
@@ -1470,6 +1515,18 @@ function App() {
                       />
                     </div>
                   )}
+
+                  <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <input
+                      type="checkbox"
+                      id="chat-force-fps"
+                      checked={chatForceFps}
+                      onChange={(e) => setChatForceFps(e.target.checked)}
+                    />
+                    <label htmlFor="chat-force-fps" className="form-label" style={{ margin: 0 }}>
+                      Force FPS ({config.target_fps.toFixed(1)})
+                    </label>
+                  </div>
 
                   <div className="form-group">
                     <label className="form-label">Resolution Mode</label>
@@ -1876,7 +1933,18 @@ function App() {
                     checked={enableThinking}
                     onChange={(e) => setEnableThinking(e.target.checked)}
                   />
-                  <label htmlFor="batch-thinking" className="form-label" style={{ margin: 0 }}>Enable Thinking</label>
+                  <label htmlFor="batch-thinking" className="form-label" style={{ margin: 0 }}>Qwen3.5 Thinking Mode</label>
+                </div>
+                <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <input
+                    type="checkbox"
+                    id="batch-force-fps"
+                    checked={batchForceFps}
+                    onChange={(e) => setBatchForceFps(e.target.checked)}
+                  />
+                  <label htmlFor="batch-force-fps" className="form-label" style={{ margin: 0 }}>
+                    Force FPS ({config.target_fps.toFixed(1)})
+                  </label>
                 </div>
                 <div className="row">
                   {!batchRunning ? (
@@ -2017,7 +2085,7 @@ function App() {
                   <input
                     type="text"
                     className="form-input"
-                    placeholder="Directory path (e.g., /path/to/dataset)"
+                    placeholder="Image base directory (e.g., /path/to/dataset/batch1)"
                     value={captionDir}
                     onChange={(e) => setCaptionDir(e.target.value)}
                     onKeyDown={(e) => { if (e.key === 'Enter') loadCaptionDir(captionDir); }}
@@ -2031,15 +2099,31 @@ function App() {
                     <FolderOpen size={16} /> Load
                   </button>
                 </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input
+                    type="text"
+                    className="form-input"
+                    placeholder="Pass A subdir"
+                    value={captionSubdirA}
+                    onChange={(e) => setCaptionSubdirA(e.target.value)}
+                    style={{ width: 120, fontSize: '0.8rem' }}
+                    title="Subdirectory name for caption pass A (e.g. pass1)"
+                  />
+                  <input
+                    type="text"
+                    className="form-input"
+                    placeholder="Pass B subdir"
+                    value={captionSubdirB}
+                    onChange={(e) => setCaptionSubdirB(e.target.value)}
+                    style={{ width: 120, fontSize: '0.8rem' }}
+                    title="Subdirectory name for caption pass B (e.g. pass2)"
+                  />
+                </div>
                 {captionPairs.length > 0 && (
                   <div className="caption-review-stats">
                     <span>{captionStats.total} images</span>
-                    <span>{captionStats.withCaptions} captioned</span>
-                    {captionStats.total - captionStats.withCaptions > 0 && (
-                      <span className="caption-missing">
-                        {captionStats.total - captionStats.withCaptions} missing
-                      </span>
-                    )}
+                    <span>{captionSubdirA}: {captionStats.withCaptionsA} done</span>
+                    {captionSubdirB && <span>{captionSubdirB}: {captionStats.withCaptionsB} done</span>}
                   </div>
                 )}
               </div>
@@ -2049,7 +2133,8 @@ function App() {
                   <ImageIcon className="empty-state-icon" />
                   <h3 className="empty-state-title">Caption Reviewer</h3>
                   <p className="empty-state-text">
-                    Enter a directory path containing images and .txt caption files to review and edit them.
+                    Enter a base image directory and subdir names for two caption passes, then click Load.
+                    Captions are stored as <code>base/pass1/stem.txt</code> and <code>base/pass2/stem.txt</code>.
                   </p>
                 </div>
               ) : (
@@ -2083,78 +2168,119 @@ function App() {
                     <button
                       className="btn btn-secondary"
                       onClick={() => setShowCaptionPreview(p => !p)}
-                      style={{
-                        width: '100%',
-                        marginBottom: 8,
-                        fontSize: '0.75rem',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        gap: 8
-                      }}
+                      style={{ width: '100%', marginBottom: 8, fontSize: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}
                     >
                       {showCaptionPreview ? <EyeOff size={14} /> : <Eye size={14} />}
                       {showCaptionPreview ? 'Hide Preview' : 'Show Preview'}
                     </button>
                     <div className="caption-review-filename">
                       {currentPair?.filename}
-                      {currentPair && !currentPair.has_caption && (
-                        <span className="caption-missing-badge">No caption file</span>
-                      )}
                     </div>
+                    {captionSaveStatus && (
+                      <span className="caption-save-status" style={{ marginTop: 4, display: 'block', textAlign: 'center' }}>{captionSaveStatus}</span>
+                    )}
+                    <button
+                      className="btn btn-danger"
+                      onClick={deleteCaption}
+                      disabled={!currentPair}
+                      title="Delete image file"
+                      style={{ width: '100%', marginTop: 8, fontSize: '0.75rem' }}
+                    >
+                      <Trash2 size={14} /> Delete Image
+                    </button>
                   </div>
 
+                  {/* Pass A */}
                   <div className="caption-review-edit-panel">
+                    <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <span style={{ background: 'var(--accent)', color: '#000', borderRadius: 3, padding: '1px 6px' }}>A</span>
+                      {captionSubdirA || 'pass1'}
+                      {currentPair && !currentPair.has_caption_a && <span className="caption-missing-badge">missing</span>}
+                    </div>
                     <textarea
                       className="caption-review-textarea"
-                      value={captionEdit}
-                      onChange={(e) => { setCaptionEdit(e.target.value); setCaptionSaveStatus(''); }}
-                      placeholder="Enter caption text..."
+                      value={captionEditA}
+                      onChange={(e) => { setCaptionEditA(e.target.value); setCaptionSaveStatus(''); }}
+                      placeholder="Pass A caption..."
                     />
                     <div className="caption-rerun-row">
                       <input
                         type="text"
                         className="form-input"
-                        placeholder="Extra instructions for re-caption (optional)..."
+                        placeholder="Extra re-caption instructions (optional)..."
                         value={rerunInstruction}
                         onChange={(e) => setRerunInstruction(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === 'Enter') rerunCaption(); }}
+                        onKeyDown={(e) => { if (e.key === 'Enter') rerunCaption('a'); }}
                         disabled={rerunning}
                         style={{ flex: 1, fontSize: '0.8rem' }}
                       />
                       <button
                         className={`btn btn-secondary ${rerunning ? 'loading' : ''}`}
-                        onClick={rerunCaption}
+                        onClick={() => rerunCaption('a')}
                         disabled={rerunning}
-                        title="Re-caption this image using the current model"
+                        title="Re-caption into Pass A"
                       >
                         <RefreshCw size={14} /> {rerunning ? 'Running…' : 'Re-caption'}
                       </button>
                     </div>
                     <div className="caption-review-edit-footer">
                       <div className="caption-review-counts">
-                        <span>{captionStats.charCount} chars</span>
-                        <span>~{captionStats.wordCount} words</span>
-                        <span>~{captionStats.tokenCount} tokens</span>
+                        <span>{captionStats.slotA.charCount} chars</span>
+                        <span>~{captionStats.slotA.wordCount} words</span>
+                        <span>~{captionStats.slotA.tokenCount} tok</span>
                       </div>
-                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                        {captionSaveStatus && (
-                          <span className="caption-save-status">{captionSaveStatus}</span>
-                        )}
+                      <button className="btn btn-primary" onClick={() => saveCaptionSlot('a')}>
+                        <Save size={16} /> Save A
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Pass B */}
+                  {captionSubdirB && (
+                    <div className="caption-review-edit-panel">
+                      <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span style={{ background: '#7c3aed', color: '#fff', borderRadius: 3, padding: '1px 6px' }}>B</span>
+                        {captionSubdirB}
+                        {currentPair && !currentPair.has_caption_b && <span className="caption-missing-badge">missing</span>}
+                      </div>
+                      <textarea
+                        className="caption-review-textarea"
+                        value={captionEditB}
+                        onChange={(e) => { setCaptionEditB(e.target.value); setCaptionSaveStatus(''); }}
+                        placeholder="Pass B caption..."
+                      />
+                      <div className="caption-rerun-row">
+                        <input
+                          type="text"
+                          className="form-input"
+                          placeholder="Extra re-caption instructions (optional)..."
+                          value={rerunInstruction}
+                          onChange={(e) => setRerunInstruction(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === 'Enter') rerunCaption('b'); }}
+                          disabled={rerunning}
+                          style={{ flex: 1, fontSize: '0.8rem' }}
+                        />
                         <button
-                          className="btn btn-danger"
-                          onClick={deleteCaption}
-                          disabled={!currentPair}
-                          title="Delete image and caption file"
+                          className={`btn btn-secondary ${rerunning ? 'loading' : ''}`}
+                          onClick={() => rerunCaption('b')}
+                          disabled={rerunning}
+                          title="Re-caption into Pass B"
                         >
-                          <Trash2 size={16} /> Delete
+                          <RefreshCw size={14} /> {rerunning ? 'Running…' : 'Re-caption'}
                         </button>
-                        <button className="btn btn-primary" onClick={saveCaptionEdit}>
-                          <Save size={16} /> Save
+                      </div>
+                      <div className="caption-review-edit-footer">
+                        <div className="caption-review-counts">
+                          <span>{captionStats.slotB.charCount} chars</span>
+                          <span>~{captionStats.slotB.wordCount} words</span>
+                          <span>~{captionStats.slotB.tokenCount} tok</span>
+                        </div>
+                        <button className="btn btn-primary" onClick={() => saveCaptionSlot('b')}>
+                          <Save size={16} /> Save B
                         </button>
                       </div>
                     </div>
-                  </div>
+                  )}
                 </div>
               )}
 
@@ -2192,6 +2318,19 @@ function App() {
                 >
                   <FolderOpen size={16} /> {batchReviewLoading ? 'Loading…' : 'Load'}
                 </button>
+                <div className="batch-review-size-control">
+                  <ImageIcon size={12} />
+                  <input
+                    type="range"
+                    min={100}
+                    max={400}
+                    step={20}
+                    value={batchReviewThumbSize}
+                    onChange={(e) => setBatchReviewThumbSize(Number(e.target.value))}
+                    title={`Thumbnail size: ${batchReviewThumbSize}px`}
+                  />
+                  <ImageIcon size={18} />
+                </div>
               </div>
               {batchReviewStatus && (
                 <div className="batch-review-stats">{batchReviewStatus}</div>
@@ -2213,7 +2352,7 @@ function App() {
                         {subdir.rel_dir}
                         <span style={{ marginLeft: 8, opacity: 0.6 }}>({subdir.total})</span>
                       </div>
-                      <div className="batch-review-grid">
+                      <div className="batch-review-grid" style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${batchReviewThumbSize}px, 1fr))` }}>
                         {subdir.images.map((img, ii) => (
                           <div key={img.image_path} className="batch-review-card">
                             <img
@@ -2230,21 +2369,21 @@ function App() {
                                 onClick={() => rotateBatchImage(si, ii, 90)}
                                 title="Rotate CCW"
                               >
-                                <RotateCcw size={10} />
+                                <RotateCcw size={14} />
                               </button>
                               <button
                                 className="batch-review-card-btn"
                                 onClick={() => rotateBatchImage(si, ii, -90)}
                                 title="Rotate CW"
                               >
-                                <RotateCw size={10} />
+                                <RotateCw size={14} />
                               </button>
                               <button
                                 className="batch-review-card-delete"
                                 onClick={() => deleteBatchImage(si, ii)}
                                 title="Delete image and caption"
                               >
-                                <Trash2 size={10} />
+                                <Trash2 size={14} />
                               </button>
                             </div>
                           </div>
@@ -2531,7 +2670,7 @@ function App() {
                     onClick={() => setEnableThinking(t => !t)}
                     title="Toggle Qwen3.5 thinking mode"
                   >
-                    {enableThinking ? '🧠 Thinking' : '⚡ Instruct'}
+                    {enableThinking ? '🧠 Qwen3.5' : '⚡ Instruct'}
                   </button>
                   <button
                     className={`context-toggle ${enableTools ? 'active' : ''}`}

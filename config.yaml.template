@@ -1,0 +1,175 @@
+# =============================================================================
+# Caption UI Prompt Templates
+# =============================================================================
+# Copy this file to config.yaml and fill in the {placeholder} sections.
+# Prompts are loaded by prompt_loader.py and injected into caption_ui.py.
+#
+# Placeholders that must be filled before use:
+#   {lexicon_requirements}   — vocabulary/style rules for your dataset
+#   {custom_instructions}    — any per-run overrides (can be empty string)
+#   {example_start}          — a short example of how your tags should open
+#   {caption_pass_1}         — injected at runtime by the pipeline (Agent 2 only)
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# User settings — loaded into the Two-Phase Batch UI via the "Load" button
+# -----------------------------------------------------------------------------
+
+lexicon_requirements: |
+  {lexicon_requirements}
+
+custom_instructions: |
+  {custom_instructions}
+
+example_start: "{example_start}"
+
+
+# -----------------------------------------------------------------------------
+# Standard captioning instructions (used by the single-pass Captioner class)
+# -----------------------------------------------------------------------------
+
+image_instruction: |
+  Analyze this image and provide a detailed caption in the following EXACT format. Fill in ALL sections:
+
+  [VISUAL]: <Detailed description of people, objects, actions, settings, colors, and movements>
+  [TEXT]: <Any on-screen text visible. If none, write "None">
+
+  You MUST fill in both sections.
+
+video_instruction: |
+  Analyze this video and provide a detailed caption in the following EXACT format. Fill in ALL sections:
+
+  [VISUAL]: <Detailed description of people, objects, actions, settings, colors, movements, and scene transitions>
+  [SPEECH]: <Word-for-word transcription of everything spoken. If no speech, write "None">
+  [SOUNDS]: <Description of music, ambient sounds, sound effects. If none, write "None">
+  [TEXT]: <Any on-screen text visible. If none, write "None">
+
+  You MUST fill in all four sections. For [SPEECH], transcribe the actual words spoken, not a summary.
+
+
+# -----------------------------------------------------------------------------
+# Two-phase captioning pipeline
+# -----------------------------------------------------------------------------
+
+phase1:
+  # Sent to Agent 001 only. Keep concise — Agent 001 sees nothing from phase2.
+  task_description: |
+    You are [AGENT_001], part of a 2-phase image captioning pipeline.
+    Your task: caption the provided image per [PHASE_1] instructions below.
+    Respond ONLY with {CAPTION_PASS_1}. No commentary, no preamble.
+
+  system: |
+    YOU ARE [AGENT_001]. Follow the instructions in <phase_1_instructions> exactly.
+
+  instruction: |
+    ** PHASE 1: Captioner **
+
+    STRICT RULES (execute sequentially):
+    1. ANCHOR: Prioritize visual evidence only. Do not infer what is not visible.
+    2. ANATOMY SCAN: Identify key visible markers.
+    3. CAPTION SYNTHESIS:
+       - Construct tag string as: [Gender] + [Anatomy Tags] + [Scene/Pose/Lighting/Clothing]
+       - Example opening: {example_start}
+       - Tags are singular, flat references. No category labels in the output.
+         BAD:  "Subject: woman, Action: standing"
+         GOOD: "woman, standing"
+       - No self-reference ("I see", "the image"). Direct tags only.
+    4. OUTPUT LIMIT: Total tags < 100 words.
+
+    LEXICON REQUIREMENTS:
+    {lexicon_requirements}
+
+    CUSTOM INSTRUCTIONS:
+    {custom_instructions}
+
+    OUTPUT FORMAT:
+    - Single comma-separated string. No line breaks.
+    - No category labels or grouping in the output.
+    - Every tag separated by a comma.
+
+    RESPONSE = {CAPTION_PASS_1}
+
+
+phase2:
+  # Sent to Agent 002. Includes phase1 instructions (for tabula rasa Task 1)
+  # and the actual {caption_pass_1} output injected at runtime.
+  task_description: |
+    You are [AGENT_002], part of a 2-phase image captioning pipeline.
+    You have 3 tasks — complete them in strict order before reading the pass 1 caption.
+
+    - Task 1: Write an independent caption (tabula rasa) per [PHASE_1] rules BEFORE reading the pass 1 caption below. → {CAPTION_PASS_2}
+    - Task 2: Read {CAPTION_PASS_1}, critique it against the image. → {PASS_1_CRITIQUE}
+    - Task 3: Reconcile {CAPTION_PASS_1} and {CAPTION_PASS_2} using {PASS_1_CRITIQUE}. → {CAPTION_FINAL}
+
+    Respond ONLY with {CAPTION_FINAL}.
+
+  system: |
+    YOU ARE [AGENT_002]. Follow <phase_2_instructions> exactly.
+    Complete Task 1 before reading the pass 1 caption block.
+
+  # Phase 1 instructions are included so Agent 002 can write the tabula rasa caption.
+  phase1_instruction: |
+    ** PHASE 1: Captioner **
+
+    STRICT RULES (execute sequentially):
+    1. ANCHOR: Prioritize visual evidence only. Do not infer what is not visible.
+    2. ANATOMY SCAN: Identify key visible markers.
+    3. CAPTION SYNTHESIS:
+       - Construct tag string as: [Gender] + [Anatomy Tags] + [Scene/Pose/Lighting/Clothing]
+       - Example opening: {example_start}
+       - Tags are singular, flat references. No category labels in the output.
+         BAD:  "Subject: woman, Action: standing"
+         GOOD: "woman, standing"
+       - No self-reference. Direct tags only.
+    4. OUTPUT LIMIT: Total tags < 100 words.
+
+    LEXICON REQUIREMENTS:
+    {lexicon_requirements}
+
+    CUSTOM INSTRUCTIONS:
+    {custom_instructions}
+
+    OUTPUT FORMAT: Single comma-separated string. No line breaks. No labels.
+
+  # Pass 1 caption is injected here at runtime by the pipeline.
+  pass1_block: |
+    --- PASS 1 CAPTION (read only after completing Task 1) ---
+    <caption_pass_1>
+    {caption_pass_1}
+    </caption_pass_1>
+
+  instruction: |
+    **[PHASE_2]: CAPTION REFINEMENT**
+
+    (Task 1) Using [PHASE_1] rules above, write a fresh independent caption for the image.
+    Do NOT read the pass 1 caption block until this task is complete. → {CAPTION_PASS_2}
+
+    (Task 2) Now read <caption_pass_1>. Create {PASS_1_CRITIQUE}:
+    - Correct factual inaccuracies or hallucinated details.
+    - Add important visible details that were missed.
+    - Remove descriptions that contradict the image.
+    - Preserve accurate details as-is. Only change language to satisfy LEXICON REQUIREMENTS.
+
+    (Task 3) Compare {CAPTION_PASS_1} and {CAPTION_PASS_2} using {PASS_1_CRITIQUE}.
+    Produce {CAPTION_FINAL}:
+    - Each tag ≤ 5 words. Split longer descriptions into two separate tags.
+    - Describe actions explicitly — do not allude or be ambiguous.
+    - No agent commentary, no category labels, no "\n" syntax.
+
+    LEXICON REQUIREMENTS:
+    {lexicon_requirements}
+
+    CUSTOM INSTRUCTIONS:
+    {custom_instructions}
+
+    OUTPUT FORMAT:
+    - Single comma-separated string. No line breaks. No labels or grouping.
+    - Every tag separated by a comma.
+
+    Example of a BAD caption:
+      "Subject: woman, Action: sitting cross-legged, Hair: long blonde hair, Setting: outdoor park bench"
+    Example of a GOOD caption:
+      "woman, sitting cross-legged, long blonde hair, outdoor park bench, soft natural light, white sundress"
+
+    RESPONSE = {CAPTION_FINAL}

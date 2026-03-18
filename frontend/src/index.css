@@ -1439,6 +1439,20 @@ textarea.form-input {
   flex-shrink: 0;
 }
 
+.batch-review-size-control {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.batch-review-size-control input[type="range"] {
+  width: 90px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
 .batch-review-stats {
   font-size: 0.75rem;
   color: var(--text-muted);
@@ -1469,8 +1483,8 @@ textarea.form-input {
 
 .batch-review-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
 }
 
 .batch-review-card {
@@ -1512,8 +1526,8 @@ textarea.form-input {
   background: transparent;
   color: var(--text-muted);
   border: 1px solid var(--border-primary);
-  border-radius: 3px;
-  padding: 2px 4px;
+  border-radius: 4px;
+  padding: 4px 6px;
   cursor: pointer;
   flex-shrink: 0;
   display: flex;
@@ -1531,8 +1545,8 @@ textarea.form-input {
   background: var(--danger);
   color: white;
   border: none;
-  border-radius: 3px;
-  padding: 2px 4px;
+  border-radius: 4px;
+  padding: 4px 6px;
   cursor: pointer;
   flex-shrink: 0;
   display: flex;
