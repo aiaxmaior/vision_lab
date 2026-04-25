@@ -168,9 +168,13 @@ interface BatchLogEntry {
 }
 
 const THOUGHT_SYNTAXES = [
-  { value: "<think>{content}</think>", label: "Qwen3.5 (Default)" },
-  { value: "", label: "No special tag" }
+  { value: "<think>{content}</think>",       label: "Qwen3 / DeepSeek" },
+  { value: "<|think|>{content}<|/think|>",   label: "Gemma 4" },
+  { value: "<thinking>{content}</thinking>", label: "Claude-style" },
+  { value: "",                               label: "None" },
+  { value: "__custom__",                     label: "Custom..." },
 ];
+const PRESET_VALUES = THOUGHT_SYNTAXES.filter(s => s.value !== "__custom__").map(s => s.value);
 
 function App() {
   // State
@@ -1764,13 +1768,26 @@ function App() {
                     <label className="form-label">Thought Syntax</label>
                     <select
                       className="form-select"
-                      value={config.thought_syntax}
-                      onChange={(e) => setConfig(c => ({ ...c, thought_syntax: e.target.value }))}
+                      value={PRESET_VALUES.includes(config.thought_syntax) ? config.thought_syntax : "__custom__"}
+                      onChange={(e) => {
+                        if (e.target.value !== "__custom__")
+                          setConfig(c => ({ ...c, thought_syntax: e.target.value }))
+                      }}
                     >
                       {THOUGHT_SYNTAXES.map(s => (
                         <option key={s.value} value={s.value}>{s.label}</option>
                       ))}
                     </select>
+                    {!PRESET_VALUES.includes(config.thought_syntax) && (
+                      <input
+                        type="text"
+                        className="form-input"
+                        style={{ marginTop: '6px' }}
+                        placeholder="e.g. <|think|>{content}<|/think|>"
+                        value={config.thought_syntax}
+                        onChange={(e) => setConfig(c => ({ ...c, thought_syntax: e.target.value }))}
+                      />
+                    )}
                   </div>
 
                   <div className="form-group">

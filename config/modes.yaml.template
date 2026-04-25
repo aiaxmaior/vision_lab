@@ -1,0 +1,72 @@
+# ============================================================================
+# Vision Lab — Interaction Mode Profiles (template)
+# ============================================================================
+#
+# Copy this file to `modes.yaml` and edit for your domain. The live
+# `modes.yaml` is in .gitignore — system prompts often contain
+# domain-specific vocabulary you may not want in public version control,
+# so the template stays in the repo and your working copy stays local.
+#
+# Each entry under `modes:` defines a named profile combining:
+#   - interaction_mode: "Analytical" | "Roleplay" | "Free-form"
+#     (matches INTERACTION_MODES in backend/main.py)
+#   - system_prompt: the system message injected (or empty for passthrough)
+#   - inject_thinking: whether to instruct the model to emit <think> blocks
+#   - description: shown in the UI mode picker
+#
+# The active mode is referenced from backend/config.json via the
+# "active_mode" field. When the frontend requests /api/config, the active
+# mode's system_prompt + interaction_mode overlay the config defaults
+# (resolve_active_mode in backend/main.py handles this).
+#
+# Edit prompts directly here — multi-line YAML (|) preserves newlines,
+# no JSON escape-hell. Endpoints exposed for UI integration:
+#   GET /api/modes              — list all profiles (metadata only)
+#   GET /api/modes/{name}       — fetch full profile including system_prompt
+# ============================================================================
+
+modes:
+
+  # --------------------------------------------------------------------------
+  # Generic analytical observer — replace system_prompt for your domain.
+  # --------------------------------------------------------------------------
+  analytical_default:
+    description: "Generic analytical observation prompt. Edit for your domain."
+    interaction_mode: "Analytical"
+    inject_thinking: true
+    system_prompt: |
+      You are an analytical observer. Examine the provided media and produce
+      a structured description covering subjects, environment, activity, and
+      camera framing. Use specific terminology rather than generalities.
+      State limitations explicitly when observation is constrained by
+      occlusion, framing, or quality.
+
+      Output sections:
+      [OBSERVATION]   — what is visible
+      [UNCERTAINTY]   — what cannot be reliably observed and why
+
+  # --------------------------------------------------------------------------
+  # Free-form — no system prompt, raw passthrough.
+  # --------------------------------------------------------------------------
+  free_form:
+    description: "No system prompt. Raw user → model passthrough for ad-hoc prompting."
+    interaction_mode: "Free-form"
+    inject_thinking: false
+    system_prompt: ""
+
+  # --------------------------------------------------------------------------
+  # Roleplay default — empty character slot. User fills system_prompt with
+  # character / scenario definition at session start.
+  # --------------------------------------------------------------------------
+  roleplay_default:
+    description: "Roleplay scaffold. Put the character / scenario definition into system_prompt before using."
+    interaction_mode: "Roleplay"
+    inject_thinking: false
+    system_prompt: ""
+
+  # --------------------------------------------------------------------------
+  # Add additional named modes here as you build them out. Common patterns:
+  #   - task-specific analyzers (one per evaluation pipeline)
+  #   - structured-JSON-output modes for downstream parsing
+  #   - critique / refinement modes for multi-pass workflows
+  # --------------------------------------------------------------------------

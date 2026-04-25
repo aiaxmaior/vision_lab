@@ -33,6 +33,7 @@ import subprocess
 import mimetypes
 import asyncio
 import os
+import yaml
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Query
@@ -58,6 +59,7 @@ app.add_middleware(
 # Config and storage paths
 CONFIG_FILE = Path(__file__).parent / "config.json"
 PROMPTS_FILE = Path(__file__).parent.parent / "config" / "prompts.json"
+MODES_FILE = Path(__file__).parent.parent / "config" / "modes.yaml"
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 CHAT_LOGS_DIR = Path(__file__).parent / "chat_logs"
@@ -68,6 +70,7 @@ THINKING_LOGS_DIR.mkdir(exist_ok=True)
 DEFAULT_CONFIG = {
     "api_url": "http://localhost:8000/v1/chat/completions",
     "model_name": "Qwen35-9B",
+    "active_mode": "",
     "processing_mode": "Native Video (vLLM)",
     "sampling_mode": "fps",
     "interval": 2.0,
@@ -104,6 +107,53 @@ def load_prompts() -> dict:
         except Exception:
             pass
     return {}
+
+
+def load_modes() -> dict:
+    """Load interaction-mode profiles from config/modes.yaml.
+
+    Returns dict shaped {"modes": {mode_name: {interaction_mode, system_prompt,
+    inject_thinking, description}, ...}} or {"modes": {}} on any failure.
+    Prompts live in YAML so multi-line content stays readable.
+    """
+    if MODES_FILE.exists():
+        try:
+            with open(MODES_FILE, 'r') as f:
+                data = yaml.safe_load(f) or {}
+            if isinstance(data, dict) and "modes" in data:
+                return data
+        except Exception:
+            pass
+    return {"modes": {}}
+
+
+def resolve_active_mode(config: dict) -> dict:
+    """Overlay the active mode's fields onto config.
+
+    If config["active_mode"] names a mode in modes.yaml and the config's
+    system_prompt is empty, copy the mode's system_prompt + interaction_mode
+    into the returned dict. A non-empty system_prompt in the config is
+    treated as a session override and wins.
+    """
+    mode_name = config.get("active_mode") or ""
+    if not mode_name:
+        return config
+    modes = load_modes().get("modes", {})
+    mode = modes.get(mode_name)
+    if not isinstance(mode, dict):
+        return config
+    resolved = dict(config)
+    if not resolved.get("system_prompt"):
+        resolved["system_prompt"] = mode.get("system_prompt", "") or ""
+    # Mode's interaction_mode wins over config when active_mode is set,
+    # since the mode defines the intended pairing.
+    im = mode.get("interaction_mode")
+    if im:
+        resolved["interaction_mode"] = im
+    it = mode.get("inject_thinking")
+    if isinstance(it, bool):
+        resolved["inject_thinking_tags"] = it
+    return resolved
 
 
 def strip_thinking_from_content(content: str) -> str:
@@ -353,7 +403,8 @@ def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, 'r') as f:
-                return {**DEFAULT_CONFIG, **json.load(f)}
+                merged = {**DEFAULT_CONFIG, **json.load(f)}
+            return resolve_active_mode(merged)
         except:
             return DEFAULT_CONFIG.copy()
     return DEFAULT_CONFIG.copy()
@@ -759,6 +810,47 @@ async def update_config(update: ConfigUpdate):
         return {"status": "success", "message": "Configuration saved"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/modes")
+async def get_modes():
+    """List all interaction-mode profiles from config/modes.yaml.
+
+    Returns {mode_name: {description, interaction_mode, inject_thinking,
+    has_system_prompt}, ...} — the system_prompt body is omitted from the
+    listing to keep the payload small. Fetch /api/modes/{name} for the
+    full body.
+    """
+    modes = load_modes().get("modes", {})
+    listing = {}
+    for name, entry in modes.items():
+        if not isinstance(entry, dict):
+            continue
+        sp = entry.get("system_prompt", "") or ""
+        listing[name] = {
+            "description": entry.get("description", ""),
+            "interaction_mode": entry.get("interaction_mode", ""),
+            "inject_thinking": bool(entry.get("inject_thinking", False)),
+            "has_system_prompt": bool(sp.strip()),
+            "system_prompt_length": len(sp),
+        }
+    return {"modes": listing}
+
+
+@app.get("/api/modes/{name}")
+async def get_mode(name: str):
+    """Fetch a single mode profile by name — full system_prompt included."""
+    modes = load_modes().get("modes", {})
+    mode = modes.get(name)
+    if not isinstance(mode, dict):
+        raise HTTPException(status_code=404, detail=f"Mode not found: {name}")
+    return {
+        "name": name,
+        "description": mode.get("description", ""),
+        "interaction_mode": mode.get("interaction_mode", ""),
+        "inject_thinking": bool(mode.get("inject_thinking", False)),
+        "system_prompt": mode.get("system_prompt", "") or "",
+    }
 
 
 @app.get("/api/models")
