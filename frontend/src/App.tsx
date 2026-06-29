@@ -28,14 +28,19 @@ import {
   Upload, Settings, Cpu, MessageSquare, Send, Trash2,
   ChevronDown, ChevronRight, RefreshCw, Paperclip, X,
   Scissors, Check, Zap, Eye, Brain, Film, Camera,
-  FolderOpen, Save, ChevronLeft, FileText, ImageIcon, Download, RotateCcw, RotateCw, EyeOff
+  FolderOpen, Save, ChevronLeft, FileText, ImageIcon, Download, RotateCcw, RotateCw, EyeOff,
+  Volume2, VolumeX, Square
 } from 'lucide-react';
 
 interface Message {
   role: 'user' | 'assistant' | 'system';
   content: string;
   hasMedia?: boolean;
+  mediaId?: string;            // uploaded media id (backend/uploads) attached to this turn, for lazy re-captioning
+  mediaType?: string;          // 'image' | 'video' of the attached upload
   screenshot?: string;
+  observation?: string;        // pass-A observation for media-attached chat turns
+  mediaCaption?: string;       // durable text caption, generated lazily when media falls out of the image window
 }
 
 interface MediaInfo {
@@ -108,6 +113,7 @@ interface Config {
   image_height: number;
   system_prompt: string;
   interaction_mode: string;
+  active_character: string;
   custom_mode: boolean;
   inject_thinking_tags: boolean;
   max_images_in_context: number;
@@ -137,6 +143,7 @@ const DEFAULT_CONFIG: Config = {
   image_height: 480,
   system_prompt: "",
   interaction_mode: "Free-form",
+  active_character: "",
   custom_mode: false,
   inject_thinking_tags: false,
   max_images_in_context: 3,
@@ -191,12 +198,21 @@ function App() {
   const [connectionStatus, setConnectionStatus] = useState<'connected' | 'offline'>('offline');
 
   // Tab state - left pane functions (chat is always visible on right)
-  const [activeTab, setActiveTab] = useState<'captions' | 'batch' | 'prompts' | 'batch-review'>('batch');
+  const [activeTab, setActiveTab] = useState<'captions' | 'batch' | 'prompts' | 'batch-review' | 'ui-prompts'>('batch');
   const [enablePaneContext, setEnablePaneContext] = useState(false);
   const [enableThinking, setEnableThinking] = useState(false);
   const [enableTools, setEnableTools] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
+  const [enableTTS, setEnableTTS] = useState(false);
+  const [enableObservationPass, setEnableObservationPass] = useState(false);
+  const [showObservation, setShowObservation] = useState(true);
+  const [ttsLoadingIdx, setTtsLoadingIdx] = useState<number | null>(null);
+  const [ttsPlayingIdx, setTtsPlayingIdx] = useState<number | null>(null);
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsAbortRef = useRef<AbortController | null>(null);
   const [showCaptionPreview, setShowCaptionPreview] = useState(true);
+  const [chatLogs, setChatLogs] = useState<{ filename: string; timestamp: string; title: string; message_count: number }[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
 
   // Prompt Manager state
   const [promptProfiles, setPromptProfiles] = useState<{ filename: string; name: string; is_default: boolean; description: string }[]>([]);
@@ -207,6 +223,13 @@ function App() {
   const [promptEditValue, setPromptEditValue] = useState('');
   const [promptSaveStatus, setPromptSaveStatus] = useState('');
   const [newProfileName, setNewProfileName] = useState('');
+
+  // UI Agent prompts (config/modes.yaml) state
+  const [uiModes, setUiModes] = useState<any>(null);
+  const [uiModeKey, setUiModeKey] = useState<'free_form' | 'analytical' | 'roleplay'>('free_form');
+  const [uiCharKey, setUiCharKey] = useState<string>('');
+  const [newCharName, setNewCharName] = useState('');
+  const [uiSaveStatus, setUiSaveStatus] = useState('');
 
   // Screenshot capture state
   const [pendingScreenshot, setPendingScreenshot] = useState<string | null>(null);
@@ -269,11 +292,72 @@ function App() {
   const [isResizing, setIsResizing] = useState(false);
   const [functionPaneWidth, setFunctionPaneWidth] = useState(500);
   const [isPaneResizing, setIsPaneResizing] = useState(false);
+  const [functionPaneCollapsed, setFunctionPaneCollapsed] = useState(false);
 
   // Refs
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  // ----- TTS helpers -----
+  const stopTTS = useCallback(() => {
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.pause();
+      try { URL.revokeObjectURL(ttsAudioRef.current.src); } catch { /* ignore */ }
+      ttsAudioRef.current = null;
+    }
+    if (ttsAbortRef.current) {
+      ttsAbortRef.current.abort();
+      ttsAbortRef.current = null;
+    }
+    setTtsLoadingIdx(null);
+    setTtsPlayingIdx(null);
+  }, []);
+
+  const speakText = useCallback(async (text: string, msgIdx: number) => {
+    stopTTS();
+    if (!text || !text.trim()) return;
+    setTtsLoadingIdx(msgIdx);
+    const ctrl = new AbortController();
+    ttsAbortRef.current = ctrl;
+    try {
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, response_format: 'wav' }),
+        signal: ctrl.signal,
+      });
+      if (!res.ok) {
+        const err = await res.text().catch(() => 'TTS error');
+        console.warn('TTS request failed:', res.status, err);
+        setTtsLoadingIdx(null);
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      ttsAudioRef.current = audio;
+      audio.onended = () => {
+        try { URL.revokeObjectURL(url); } catch { /* ignore */ }
+        if (ttsAudioRef.current === audio) ttsAudioRef.current = null;
+        setTtsPlayingIdx(p => p === msgIdx ? null : p);
+      };
+      audio.onerror = () => {
+        try { URL.revokeObjectURL(url); } catch { /* ignore */ }
+        if (ttsAudioRef.current === audio) ttsAudioRef.current = null;
+        setTtsPlayingIdx(null);
+      };
+      setTtsLoadingIdx(null);
+      setTtsPlayingIdx(msgIdx);
+      await audio.play();
+    } catch (e) {
+      if (!(e instanceof Error && e.name === 'AbortError')) {
+        console.warn('TTS error:', e);
+      }
+      setTtsLoadingIdx(null);
+      setTtsPlayingIdx(null);
+    }
+  }, [stopTTS]);
 
   // Sidebar resize handlers
   const handleMouseDown = useCallback(() => {
@@ -347,6 +431,7 @@ function App() {
     fetch('/api/caption-targets').then(r => r.json()).then(d => setCaptionTargets(d.targets || [])).catch(() => { });
     loadPromptProfiles();
     loadPromptProfile('prompts.json');
+    loadUiModes();
   }, []);
 
   // Update token estimate when media or settings change
@@ -487,8 +572,13 @@ function App() {
           frequency_penalty: config.frequency_penalty,
           seed: config.seed,
           enable_thinking: enableThinking,
+          enable_observation_pass: enableObservationPass,
           interaction_mode: config.interaction_mode,
-          system_prompt: config.system_prompt,
+          active_character: config.active_character,
+          // Agent prompt comes solely from modes.yaml (Roleplay: the character dict),
+          // never from backend/config.json. Sending '' lets the backend fall through
+          // to the active mode's text_prompt instead of a stale config.json system_prompt.
+          system_prompt: '',
           inject_thinking: config.inject_thinking_tags,
           custom_mode: config.custom_mode,
           thought_syntax: config.thought_syntax,
@@ -533,13 +623,24 @@ function App() {
 
             try {
               const parsed = JSON.parse(data);
-              if (parsed.tool_call) {
+              if (parsed.observation) {
+                setMessages(prev => {
+                  const newMsgs = [...prev];
+                  const last = newMsgs[newMsgs.length - 1];
+                  if (last && last.role === 'assistant') {
+                    newMsgs[newMsgs.length - 1] = { ...last, observation: parsed.observation };
+                  }
+                  return newMsgs;
+                });
+              } else if (parsed.observation_error) {
+                console.warn('Observation pass failed:', parsed.observation_error);
+              } else if (parsed.tool_call) {
                 const tc = parsed.tool_call;
                 const argsStr = JSON.stringify(tc.arguments, null, 2);
                 assistantContent += `\n\n**🔧 Tool Call:** \`${tc.name}\`\n\`\`\`json\n${argsStr}\n\`\`\`\n`;
                 setMessages(prev => {
                   const newMsgs = [...prev];
-                  newMsgs[newMsgs.length - 1] = { role: 'assistant', content: assistantContent };
+                  newMsgs[newMsgs.length - 1] = { ...newMsgs[newMsgs.length - 1], role: 'assistant', content: assistantContent };
                   return newMsgs;
                 });
               } else if (parsed.tool_result) {
@@ -550,20 +651,26 @@ function App() {
                     ? `✅ Read ${tr.result.size} bytes from \`${tr.result.path}\``
                     : tr.name === 'write_file'
                       ? `✅ Wrote ${tr.result.size} bytes to \`${tr.result.path}\``
-                      : tr.name === 'list_directory'
+                      : tr.name === 'view_media'
+                      ? `✅ Viewed ${tr.result.media_type} \`${tr.result.path}\``
+                    : tr.name === 'list_directory'
                         ? `✅ Found ${tr.result.count} entries in \`${tr.result.path}\``
-                        : `✅ ${JSON.stringify(tr.result)}`;
+                        : tr.name === 'web_search'
+                          ? `✅ ${tr.result.results?.length || 0} results for "${tr.result.query}"${(tr.result.results || []).slice(0, 5).map((r: any) => `\n  - [${r.title}](${r.url})`).join('')}`
+                          : tr.name === 'fetch_url'
+                            ? `✅ Fetched ${tr.result.length} chars from \`${tr.result.url}\`${tr.result.truncated ? ' (truncated)' : ''}`
+                            : `✅ ${JSON.stringify(tr.result)}`;
                 assistantContent += `**Result:** ${resStr}\n\n`;
                 setMessages(prev => {
                   const newMsgs = [...prev];
-                  newMsgs[newMsgs.length - 1] = { role: 'assistant', content: assistantContent };
+                  newMsgs[newMsgs.length - 1] = { ...newMsgs[newMsgs.length - 1], role: 'assistant', content: assistantContent };
                   return newMsgs;
                 });
               } else if (parsed.content) {
                 assistantContent += parsed.content;
                 setMessages(prev => {
                   const newMsgs = [...prev];
-                  newMsgs[newMsgs.length - 1] = { role: 'assistant', content: assistantContent };
+                  newMsgs[newMsgs.length - 1] = { ...newMsgs[newMsgs.length - 1], role: 'assistant', content: assistantContent };
                   return newMsgs;
                 });
               }
@@ -593,7 +700,17 @@ function App() {
     } finally {
       setIsLoading(false);
       abortControllerRef.current = null;
-      setMessages(prev => { autoSaveChat(prev); return prev; });
+      setMessages(prev => {
+        autoSaveChat(prev);
+        // Auto-TTS: speak the just-completed assistant message if enabled
+        if (enableTTS && prev.length > 0) {
+          const last = prev[prev.length - 1];
+          if (last.role === 'assistant' && last.content && !last.content.startsWith('**Error:')) {
+            speakText(last.content, prev.length - 1);
+          }
+        }
+        return prev;
+      });
     }
   };
 
@@ -608,6 +725,8 @@ function App() {
       role: 'user',
       content: userMessage,
       hasMedia: includeMedia,
+      mediaId: includeMedia && media ? media.id : undefined,
+      mediaType: includeMedia && media ? media.info?.media_type : undefined,
       screenshot: pendingScreenshot || undefined,
     }]);
     setInput('');
@@ -666,11 +785,24 @@ function App() {
     if (msgs.length < 2) return;
     const firstUserMsg = msgs.find(m => m.role === 'user');
     const title = firstUserMsg ? firstUserMsg.content.slice(0, 80) : 'chat';
+    const sampling = {
+      seed: config.seed,
+      temperature: config.temperature,
+      top_p: config.top_p,
+      top_k: config.top_k,
+      min_p: config.min_p,
+      repetition_penalty: config.repetition_penalty,
+      presence_penalty: config.presence_penalty,
+      frequency_penalty: config.frequency_penalty,
+      enable_thinking: enableThinking,
+      inject_thinking_tags: config.inject_thinking_tags,
+      max_tokens: config.max_tokens,
+    };
     try {
       await fetch('/api/chat/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: msgs, title })
+        body: JSON.stringify({ messages: msgs, title, sampling })
       });
     } catch { /* silent */ }
   };
@@ -723,6 +855,49 @@ function App() {
   const clearChat = () => {
     setMessages([]);
     setLastSentMedia(null);
+  };
+
+  // --- Chat history (reload previous conversations) ---
+  const loadChatLogs = async () => {
+    try {
+      const res = await fetch('/api/chat/logs');
+      const data = await res.json();
+      setChatLogs(data.logs || []);
+    } catch { /* ignore */ }
+  };
+
+  const loadChat = async (filename: string) => {
+    try {
+      const res = await fetch(`/api/chat/logs/${encodeURIComponent(filename)}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const restored: Message[] = (data.messages || []).map((m: any) => ({
+        role: m.role,
+        content: m.content || '',
+        hasMedia: m.hasMedia || false,
+        mediaId: m.mediaId,
+        mediaType: m.mediaType,
+        screenshot: m.screenshot,
+        observation: m.observation,
+        mediaCaption: m.mediaCaption,
+      }));
+      setMessages(restored);
+      setLastSentMedia(null);   // uploaded media can't be re-attached; screenshots/observations are restored
+      setShowHistory(false);
+    } catch { /* ignore */ }
+  };
+
+  const deleteChatLog = async (filename: string) => {
+    try {
+      await fetch(`/api/chat/logs/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+      setChatLogs(prev => prev.filter(l => l.filename !== filename));
+    } catch { /* ignore */ }
+  };
+
+  const toggleHistory = () => {
+    const next = !showHistory;
+    setShowHistory(next);
+    if (next) loadChatLogs();
   };
 
   const clearMedia = () => {
@@ -1190,6 +1365,91 @@ function App() {
     return sections;
   };
 
+  // --- UI Agent prompts (config/modes.yaml) ---
+  const loadUiModes = async () => {
+    try {
+      const res = await fetch('/api/ui-modes');
+      const data = await res.json();
+      const m = data.ui_modes || {};
+      setUiModes(m);
+      const rpActive = m.roleplay?.active_character || '';
+      if (rpActive) setUiCharKey(rpActive);
+    } catch { /* ignore */ }
+  };
+
+  const getUiField = (field: string): string => {
+    const mode = uiModes?.[uiModeKey] || {};
+    if (field === 'media_image') return mode.media_prompt?.image ?? '';
+    if (field === 'media_video') return mode.media_prompt?.video ?? '';
+    if (field === 'text_prompt' && uiModeKey === 'roleplay') {
+      return mode.characters?.[uiCharKey]?.text_prompt ?? '';
+    }
+    return mode[field] ?? '';
+  };
+
+  const updateUiField = (field: string, value: string) => {
+    setUiModes((prev: any) => {
+      const next = JSON.parse(JSON.stringify(prev || {}));
+      if (!next[uiModeKey]) next[uiModeKey] = {};
+      if (field === 'media_image' || field === 'media_video') {
+        if (!next[uiModeKey].media_prompt) next[uiModeKey].media_prompt = {};
+        next[uiModeKey].media_prompt[field === 'media_image' ? 'image' : 'video'] = value;
+      } else if (field === 'text_prompt' && uiModeKey === 'roleplay') {
+        if (!uiCharKey) return prev;
+        if (!next.roleplay.characters) next.roleplay.characters = {};
+        if (!next.roleplay.characters[uiCharKey]) next.roleplay.characters[uiCharKey] = {};
+        next.roleplay.characters[uiCharKey].text_prompt = value;
+      } else {
+        next[uiModeKey][field] = value;
+      }
+      return next;
+    });
+    setUiSaveStatus('Modified (unsaved)');
+  };
+
+  const addCharacter = () => {
+    const name = newCharName.trim();
+    if (!name) return;
+    setUiModes((prev: any) => {
+      const next = JSON.parse(JSON.stringify(prev || {}));
+      if (!next.roleplay) next.roleplay = { interaction_mode: 'Roleplay', observation_prompt: '', media_prompt: { image: '', video: '' } };
+      if (!next.roleplay.characters) next.roleplay.characters = {};
+      if (!next.roleplay.characters[name]) next.roleplay.characters[name] = { text_prompt: '' };
+      return next;
+    });
+    setUiCharKey(name);
+    setNewCharName('');
+    setUiSaveStatus('Modified (unsaved)');
+  };
+
+  const deleteCharacter = () => {
+    if (!uiCharKey) return;
+    setUiModes((prev: any) => {
+      const next = JSON.parse(JSON.stringify(prev || {}));
+      if (next.roleplay?.characters) delete next.roleplay.characters[uiCharKey];
+      return next;
+    });
+    setUiCharKey('');
+    setUiSaveStatus('Modified (unsaved)');
+  };
+
+  const saveUiModes = async () => {
+    if (!uiModes) return;
+    try {
+      const payload = JSON.parse(JSON.stringify(uiModes));
+      if (payload.roleplay) {
+        payload.roleplay.active_character = config.active_character || payload.roleplay.active_character || '';
+      }
+      const res = await fetch('/api/ui-modes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ui_modes: payload }),
+      });
+      if (res.ok) { setUiModes(payload); setUiSaveStatus('Saved ✓'); }
+      else setUiSaveStatus('Save failed');
+    } catch { setUiSaveStatus('Save failed'); }
+  };
+
   const getPaneContext = (): string => {
     if (!enablePaneContext) return '';
     if (activeTab === 'batch') {
@@ -1598,6 +1858,22 @@ function App() {
                     </div>
                   </div>
 
+                  {config.interaction_mode === 'Roleplay' && (
+                    <div className="form-group">
+                      <label className="form-label">Character</label>
+                      <select
+                        className="form-select"
+                        value={config.active_character}
+                        onChange={(e) => setConfig(c => ({ ...c, active_character: e.target.value }))}
+                      >
+                        <option value="">(mode default)</option>
+                        {Object.keys(uiModes?.roleplay?.characters || {}).map(name => (
+                          <option key={name} value={name}>{name}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
                   <div className="row">
                     <label className={`form-checkbox ${config.inject_thinking_tags ? 'active' : ''}`}>
                       <input
@@ -1866,6 +2142,8 @@ function App() {
       {/* Main Content Area - Dual Pane */}
       <main className="main-content">
         {/* LEFT PANE: Function Tabs */}
+        {!functionPaneCollapsed && (
+        <>
         <div className="function-pane" ref={functionPaneRef} style={{ width: functionPaneWidth, flex: 'none' }}>
           <div className="tab-bar">
             <button
@@ -1891,6 +2169,19 @@ function App() {
               onClick={() => setActiveTab('prompts')}
             >
               <Settings size={16} /> Prompts
+            </button>
+            <button
+              className={`tab-btn ${activeTab === 'ui-prompts' ? 'active' : ''}`}
+              onClick={() => setActiveTab('ui-prompts')}
+            >
+              <Brain size={16} /> UI Prompts
+            </button>
+            <button
+              className="tab-collapse-btn"
+              onClick={() => setFunctionPaneCollapsed(true)}
+              title="Hide tabs panel"
+            >
+              <ChevronLeft size={16} />
             </button>
           </div>
 
@@ -2514,6 +2805,115 @@ function App() {
                 </div>
               </div>
             </div>
+          ) : activeTab === 'ui-prompts' ? (
+            /* UI Agent Prompts (config/modes.yaml) */
+            <div className="batch-panel">
+              <div className="batch-config">
+                <div className="form-group">
+                  <label className="form-label">Mode</label>
+                  <select
+                    className="form-select"
+                    value={uiModeKey}
+                    onChange={(e) => setUiModeKey(e.target.value as 'free_form' | 'analytical' | 'roleplay')}
+                  >
+                    <option value="free_form">Free-form</option>
+                    <option value="analytical">Analytical</option>
+                    <option value="roleplay">Roleplay</option>
+                  </select>
+                </div>
+
+                {uiModeKey === 'roleplay' && (
+                  <div className="form-group">
+                    <label className="form-label">Character (editing)</label>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <select
+                        className="form-select"
+                        style={{ flex: 1 }}
+                        value={uiCharKey}
+                        onChange={(e) => setUiCharKey(e.target.value)}
+                      >
+                        <option value="">(select a character)</option>
+                        {Object.keys(uiModes?.roleplay?.characters || {}).map(name => (
+                          <option key={name} value={name}>{name}</option>
+                        ))}
+                      </select>
+                      <input
+                        type="text"
+                        className="form-input"
+                        placeholder="New character..."
+                        value={newCharName}
+                        onChange={(e) => setNewCharName(e.target.value)}
+                        style={{ flex: 1 }}
+                      />
+                      <button className="btn btn-secondary" onClick={addCharacter} disabled={!newCharName.trim()}>
+                        Add
+                      </button>
+                      <button className="btn btn-secondary btn-icon" onClick={deleteCharacter} disabled={!uiCharKey} title="Delete character">
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 12, padding: '0 4px' }}>
+                <div className="form-group">
+                  <label className="form-label">
+                    Text Prompt{uiModeKey === 'roleplay' ? ` — ${uiCharKey || 'no character selected'}` : ''}
+                  </label>
+                  <textarea
+                    className="caption-review-textarea"
+                    style={{ minHeight: 120 }}
+                    value={getUiField('text_prompt')}
+                    disabled={uiModeKey === 'roleplay' && !uiCharKey}
+                    placeholder={uiModeKey === 'roleplay' ? 'Select or add a character to edit its prompt...' : 'System / identity prompt for this mode...'}
+                    onChange={(e) => updateUiField('text_prompt', e.target.value)}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Observation Prompt (Observe pass)</label>
+                  <textarea
+                    className="caption-review-textarea"
+                    style={{ minHeight: 90 }}
+                    value={getUiField('observation_prompt')}
+                    placeholder="Pass A instruction when Observe is ON. Empty = fall back to config.json default."
+                    onChange={(e) => updateUiField('observation_prompt', e.target.value)}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Media Prompt — Image (Observe OFF)</label>
+                  <textarea
+                    className="caption-review-textarea"
+                    style={{ minHeight: 70 }}
+                    value={getUiField('media_image')}
+                    placeholder="Prepended to a normal turn when an image is attached."
+                    onChange={(e) => updateUiField('media_image', e.target.value)}
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Media Prompt — Video (Observe OFF)</label>
+                  <textarea
+                    className="caption-review-textarea"
+                    style={{ minHeight: 70 }}
+                    value={getUiField('media_video')}
+                    placeholder="Prepended to a normal turn when a video is attached."
+                    onChange={(e) => updateUiField('media_video', e.target.value)}
+                  />
+                </div>
+              </div>
+
+              <div className="batch-summary" style={{ alignItems: 'center', gap: 8 }}>
+                <button className="btn btn-primary" onClick={saveUiModes} style={{ flex: 1 }}>
+                  <Save size={14} /> Save UI Prompts
+                </button>
+                {uiSaveStatus && (
+                  <span style={{ fontSize: '0.8rem', color: 'var(--success)' }}>{uiSaveStatus}</span>
+                )}
+              </div>
+            </div>
           ) : null}
         </div>
 
@@ -2522,6 +2922,18 @@ function App() {
           className={`resize-handle ${isPaneResizing ? 'active' : ''}`}
           onMouseDown={handlePaneMouseDown}
         />
+        </>
+        )}
+
+        {functionPaneCollapsed && (
+          <button
+            className="function-pane-reopen"
+            onClick={() => setFunctionPaneCollapsed(false)}
+            title="Show tabs panel"
+          >
+            <ChevronRight size={16} />
+          </button>
+        )}
 
         {/* RIGHT PANE: Persistent Chat */}
         <div className="chat-pane">
@@ -2549,6 +2961,53 @@ function App() {
 
           {/* Messages */}
           <div className="messages-area">
+            {showHistory && (
+              <div style={{
+                border: '1px solid var(--border, #333)',
+                borderRadius: 8,
+                margin: '0 0 12px',
+                background: 'var(--bg-secondary, #1a1a1a)',
+                maxHeight: 260,
+                overflowY: 'auto',
+              }}>
+                <div style={{
+                  padding: '8px 12px', fontSize: '0.85rem', fontWeight: 600,
+                  borderBottom: '1px solid var(--border, #333)',
+                  display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                }}>
+                  <span>Previous chats ({chatLogs.length})</span>
+                  <button className="btn btn-secondary btn-icon" onClick={() => setShowHistory(false)} title="Close">
+                    <ChevronLeft size={14} />
+                  </button>
+                </div>
+                {chatLogs.length === 0 ? (
+                  <div style={{ padding: 12, fontSize: '0.8rem', opacity: 0.7 }}>No saved chats yet.</div>
+                ) : (
+                  chatLogs.map(log => (
+                    <div key={log.filename} style={{
+                      display: 'flex', alignItems: 'center', gap: 8,
+                      padding: '6px 12px', borderBottom: '1px solid var(--border-subtle, #222)',
+                    }}>
+                      <button
+                        onClick={() => loadChat(log.filename)}
+                        style={{ flex: 1, textAlign: 'left', background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', overflow: 'hidden' }}
+                        title="Load this chat"
+                      >
+                        <div style={{ fontSize: '0.85rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          {log.title || '(untitled)'}
+                        </div>
+                        <div style={{ fontSize: '0.7rem', opacity: 0.6 }}>
+                          {log.timestamp?.slice(0, 19).replace('T', ' ')} · {log.message_count} msgs
+                        </div>
+                      </button>
+                      <button className="btn btn-secondary btn-icon" onClick={() => deleteChatLog(log.filename)} title="Delete this log">
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
             {messages.length === 0 ? (
               <div className="empty-state">
                 <Eye className="empty-state-icon" />
@@ -2568,6 +3027,14 @@ function App() {
                       const displayContent = thinkMatch ? thinkMatch[2].trim() : raw;
                       return (
                         <>
+                          {showObservation && msg.observation && (
+                            <div className="thinking-block" style={{ borderLeftColor: 'var(--accent-secondary, #4a90e2)' }}>
+                              <div className="thinking-block-header">
+                                <Eye size={12} /> Observation (silent context for the response below)
+                              </div>
+                              <div className="thinking-block-content">{msg.observation}</div>
+                            </div>
+                          )}
                           {showThinking && thinkBlock && (
                             <div className="thinking-block">
                               <div className="thinking-block-header">
@@ -2605,7 +3072,7 @@ function App() {
                       msg.content
                     )}
                   </div>
-                  {(msg.hasMedia || msg.screenshot) && (
+                  {(msg.hasMedia || msg.screenshot || msg.role === 'assistant') && (
                     <div className="message-meta">
                       {msg.hasMedia && (
                         <span className="message-attachment">
@@ -2619,6 +3086,27 @@ function App() {
                         >
                           <Camera size={12} /> Screenshot attached
                         </span>
+                      )}
+                      {msg.role === 'assistant' && msg.content && (
+                        ttsPlayingIdx === i ? (
+                          <span className="message-attachment" style={{ cursor: 'pointer' }}
+                            onClick={stopTTS}
+                            title="Stop playback"
+                          >
+                            <Square size={12} /> Stop
+                          </span>
+                        ) : ttsLoadingIdx === i ? (
+                          <span className="message-attachment" title="Synthesizing…">
+                            <Volume2 size={12} /> …
+                          </span>
+                        ) : (
+                          <span className="message-attachment" style={{ cursor: 'pointer' }}
+                            onClick={() => speakText(msg.content, i)}
+                            title="Speak this message via TTS"
+                          >
+                            <Volume2 size={12} /> Speak
+                          </span>
+                        )
                       )}
                     </div>
                   )}
@@ -2692,7 +3180,7 @@ function App() {
                   <button
                     className={`context-toggle ${enableTools ? 'active' : ''}`}
                     onClick={() => setEnableTools(t => !t)}
-                    title="Enable agentic tool use (read/write files, list directories)"
+                    title="Enable agentic tool use (read/write files, list directories, web search, fetch URL)"
                   >
                     <Zap size={12} /> {enableTools ? 'Tools ON' : 'Tools'}
                   </button>
@@ -2702,6 +3190,32 @@ function App() {
                     title="Show thinking/reasoning text in chat messages"
                   >
                     <Brain size={12} /> {showThinking ? 'Thinking Visible' : 'Show Thinking'}
+                  </button>
+                  <button
+                    className={`context-toggle ${enableTTS ? 'active' : ''}`}
+                    onClick={() => {
+                      const next = !enableTTS;
+                      setEnableTTS(next);
+                      if (!next) stopTTS();
+                    }}
+                    title="Auto-speak assistant replies via the TTS server (configure backend tts_* keys in config.json)"
+                  >
+                    {enableTTS ? <Volume2 size={12} /> : <VolumeX size={12} />}
+                    {enableTTS ? ' TTS ON' : ' TTS'}
+                  </button>
+                  <button
+                    className={`context-toggle ${enableObservationPass ? 'active' : ''}`}
+                    onClick={() => setEnableObservationPass(o => !o)}
+                    title="When media is attached, run a structured observation pass first; inject result as silent context for the response"
+                  >
+                    <Eye size={12} /> {enableObservationPass ? 'Observe ON' : 'Observe'}
+                  </button>
+                  <button
+                    className={`context-toggle ${showObservation ? 'active' : ''}`}
+                    onClick={() => setShowObservation(o => !o)}
+                    title="Show/hide the observation block above responses (when an Observe pass ran)"
+                  >
+                    {showObservation ? <Eye size={12} /> : <EyeOff size={12} />} {showObservation ? 'Obs Visible' : 'Show Obs'}
                   </button>
                 </div>
                 <div className="chat-controls">
@@ -2726,6 +3240,13 @@ function App() {
                   title="Retry last response"
                 >
                   <RotateCcw size={16} />
+                </button>
+                <button
+                  className={`btn btn-secondary btn-icon ${showHistory ? 'active' : ''}`}
+                  onClick={toggleHistory}
+                  title="Load a previous chat"
+                >
+                  <FolderOpen size={16} />
                 </button>
                 <button
                   className="btn btn-secondary btn-icon"

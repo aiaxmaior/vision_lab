@@ -6,3 +6,4 @@ opencv-python>=4.9.0.80
 Pillow>=10.2.0
 pydantic>=2.5.0
 PyYAML>=6.0
+ddgs>=6.0          # DuckDuckGo web_search tool (agentic chat). Swap providers via config.json search_provider.

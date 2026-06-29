@@ -70,7 +70,7 @@ THINKING_LOGS_DIR.mkdir(exist_ok=True)
 DEFAULT_CONFIG = {
     "api_url": "http://localhost:8000/v1/chat/completions",
     "model_name": "Qwen35-9B",
-    "active_mode": "",
+    "active_character": "",
     "processing_mode": "Native Video (vLLM)",
     "sampling_mode": "fps",
     "interval": 2.0,
@@ -94,7 +94,96 @@ DEFAULT_CONFIG = {
     "frequency_penalty": 0.0,
     "seed": -1,
     "thought_syntax": "<think>{content}</think>",
-    "vram_limit": 170000
+    "vram_limit": 170000,
+    # TTS integration (any OpenAI-compatible TTS server, default: local supertonic+omnivoice on :8800)
+    "tts_enabled": False,
+    "tts_url": "http://localhost:8800/v1/audio/speech",
+    "tts_model": "omnivoice",          # "omnivoice" | "supertonic"
+    "tts_voice": "F2",                  # supertonic voice key OR ignored if ref_audio set
+    "tts_ref_audio": "",                # path to reference WAV for omnivoice voice cloning
+    "tts_instruct": "",                 # voice design string for omnivoice (alt to ref_audio)
+    "tts_speed": 1.0,
+    "tts_strip_thinking": True,         # strip <think>...</think> before synthesis
+    # Two-pass observation (opt-in): when media is attached, the VLM first runs
+    # a brief structured observation pass, then its observation is injected as
+    # silent context into the system message of the actual response generation.
+    # Inspired by REVEAL's "make the signal explicit and inspectable" principle.
+    "enable_observation_pass": False,
+    # The currently active observation prompt. Swap this string with one of the
+    # variants in `observation_prompt_examples` below (or fine-tune your own)
+    # to change pass-A behavior. Default = neutral prose (good for RP + general).
+    "observation_prompt": (
+        "Describe what is visible in the attached media in 4-6 sentences of plain "
+        "neutral prose. Be specific about subjects (named colors, positions, postures), "
+        "setting (location, lighting, time of day), and activity. Don't interpret, "
+        "don't ask questions, don't speculate about meaning or emotion — just describe "
+        "what's there as if dictating into a notebook. If something is unclear due to "
+        "occlusion, framing, or quality, say so plainly."
+    ),
+    # Reference variants — copy one into `observation_prompt` above to switch.
+    # The leading underscore signals "documentation / not loaded as live config."
+    "_observation_prompt_examples": {
+        "neutral_prose": (
+            "Describe what is visible in the attached media in 4-6 sentences of plain "
+            "neutral prose. Be specific about subjects, setting, and activity. Don't "
+            "interpret or speculate — just describe what's there. State limitations plainly."
+        ),
+        "structured_forensic": (
+            "Take a careful structured observation pass. Produce ONLY a concise "
+            "observation block — do not answer any question yet. Format:\n"
+            "[SUBJECTS] who/what is present (entities, count, relationships)\n"
+            "[SETTING] where, when, lighting/conditions, framing\n"
+            "[ACTIVITY] what is happening\n"
+            "[NOTABLE] non-obvious details that might be relevant to follow-up questions\n"
+            "[UNCERTAIN] anything you cannot reliably observe (occlusion, framing, quality)\n"
+            "Be specific — name colors, positions, postures, text. Avoid generalities."
+        ),
+        "cinematic_third_person": (
+            "Describe the attached media as if writing a single paragraph of stage "
+            "direction for a screenplay. Use evocative but concrete language: actual "
+            "colors, postures, gaze direction, light quality, spatial relationships. "
+            "No dialogue, no interpretation of motive, no questions. 4-7 sentences."
+        ),
+        "first_person_perception": (
+            "You are about to relay what is visible in the attached media to someone "
+            "who cannot see it. Speak in the present tense, as if standing there yourself. "
+            "Lead with the most immediate impression, then fill in details: subjects, "
+            "setting, activity, anything notable. 3-6 sentences. Don't editorialize."
+        ),
+        "technical_quantitative": (
+            "Produce a technical inventory of the attached media. List:\n"
+            "- Composition: framing (wide/medium/close), camera angle, depth of field\n"
+            "- Subjects: count, position (e.g., left-third foreground), bounding-box "
+            "estimate of dominant subject as fraction of frame\n"
+            "- Lighting: source direction, hard/soft, color temperature estimate\n"
+            "- Notable objects with approximate location\n"
+            "- Quality artifacts (motion blur, compression, focus issues)\n"
+            "Be quantitative where possible. Skip interpretation."
+        ),
+        "terse_factual": (
+            "List 5-8 short factual observations about the attached media, one per line, "
+            "no preamble, no interpretation. Examples of granularity: 'two people seated', "
+            "'wooden table center frame', 'overcast daylight from left'."
+        ),
+        "rp_character_voice_hint": (
+            "Describe what is visible in the attached media in plain present-tense prose, "
+            "as if you were the perceiver looking at the scene right now. Lead with the "
+            "most striking element. Be specific (colors, positions, expressions) without "
+            "interpreting emotion or asking questions. 4-6 sentences. The text you produce "
+            "will become silent perceptual context for an in-character response — write "
+            "it so a character could read it as their own immediate impression."
+        ),
+    },
+    "observation_max_tokens": 1024,
+    "observation_temperature": 0.4,
+    "observation_include_media_in_pass_b": True,  # if False, pass B sees only the observation text, not the media (cheaper)
+    # --- Agentic web tools (web_search / fetch_url) ---
+    "search_provider": "duckduckgo",   # "duckduckgo" | "searxng" | "tavily" | "brave"
+    "search_max_results": 5,
+    "searxng_url": "",                 # e.g. http://localhost:8888  (SearXNG instance with JSON API enabled)
+    "tavily_api_key": "",
+    "brave_api_key": "",
+    "fetch_url_max_chars": 8000        # cap on fetch_url text length to protect context budget
 }
 
 
@@ -109,51 +198,90 @@ def load_prompts() -> dict:
     return {}
 
 
-def load_modes() -> dict:
-    """Load interaction-mode profiles from config/modes.yaml.
+UI_MODE_KEYS = {
+    "Free-form": "free_form",
+    "Analytical": "analytical",
+    "Roleplay": "roleplay",
+}
 
-    Returns dict shaped {"modes": {mode_name: {interaction_mode, system_prompt,
-    inject_thinking, description}, ...}} or {"modes": {}} on any failure.
-    Prompts live in YAML so multi-line content stays readable.
+
+def load_modes() -> dict:
+    """Load UI-agent prompt profiles from config/modes.yaml.
+
+    Returns {"ui_modes": {free_form|analytical|roleplay: {text_prompt,
+    observation_prompt, media_prompt: {image, video}, ...}}} or
+    {"ui_modes": {}} on any failure. Prompts live in YAML so multi-line
+    content stays readable.
     """
     if MODES_FILE.exists():
         try:
             with open(MODES_FILE, 'r') as f:
                 data = yaml.safe_load(f) or {}
-            if isinstance(data, dict) and "modes" in data:
+            if isinstance(data, dict) and "ui_modes" in data:
                 return data
         except Exception:
             pass
-    return {"modes": {}}
+    return {"ui_modes": {}}
 
 
-def resolve_active_mode(config: dict) -> dict:
-    """Overlay the active mode's fields onto config.
+def save_modes(data: dict):
+    """Persist the full ui_modes object back to config/modes.yaml."""
+    MODES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(MODES_FILE, 'w') as f:
+        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True,
+                       default_flow_style=False)
 
-    If config["active_mode"] names a mode in modes.yaml and the config's
-    system_prompt is empty, copy the mode's system_prompt + interaction_mode
-    into the returned dict. A non-empty system_prompt in the config is
-    treated as a session override and wins.
+
+def resolve_ui_mode(interaction_mode: str, active_character: str = "") -> dict:
+    """Resolve the prompt bundle for a given interaction mode.
+
+    Returns {text_prompt, observation_prompt, media_image, media_video}.
+    For Roleplay, the selected character's text_prompt (if any) overrides the
+    mode-level text_prompt.
     """
-    mode_name = config.get("active_mode") or ""
-    if not mode_name:
-        return config
-    modes = load_modes().get("modes", {})
-    mode = modes.get(mode_name)
-    if not isinstance(mode, dict):
-        return config
-    resolved = dict(config)
-    if not resolved.get("system_prompt"):
-        resolved["system_prompt"] = mode.get("system_prompt", "") or ""
-    # Mode's interaction_mode wins over config when active_mode is set,
-    # since the mode defines the intended pairing.
-    im = mode.get("interaction_mode")
-    if im:
-        resolved["interaction_mode"] = im
-    it = mode.get("inject_thinking")
-    if isinstance(it, bool):
-        resolved["inject_thinking_tags"] = it
-    return resolved
+    ui_modes = load_modes().get("ui_modes", {})
+    key = UI_MODE_KEYS.get(interaction_mode, "free_form")
+    mode = ui_modes.get(key, {}) or {}
+    media = mode.get("media_prompt", {}) or {}
+    bundle = {
+        "text_prompt": mode.get("text_prompt", "") or "",
+        "observation_prompt": mode.get("observation_prompt", "") or "",
+        "media_image": media.get("image", "") or "",
+        "media_video": media.get("video", "") or "",
+    }
+    if key == "roleplay":
+        chars = mode.get("characters", {}) or {}
+        char_name = active_character or mode.get("active_character", "") or ""
+        char = chars.get(char_name, {}) or {}
+        if isinstance(char, dict) and char.get("text_prompt"):
+            bundle["text_prompt"] = char["text_prompt"]
+    return bundle
+
+
+def normalize_reasoning_channels(content: str) -> str:
+    """Convert gemma4's leaked channel markup into <think>...</think> blocks.
+
+    The abliterated gemma4 model emits chain-of-thought inside the content field
+    as malformed harmony-style channel tokens, e.g.
+        <|channel>thought\\n...reasoning...<channel|>answer
+    vLLM does not route this to the OpenAI `reasoning` field, so without this the
+    markup leaks raw into the visible answer and into saved history. Rewrite
+    well-formed channel pairs to <think>...</think> (which the UI collapses and
+    the history stripper recognizes) and drop any stray/unterminated markers.
+    """
+    if not isinstance(content, str) or "<|channel>" not in content:
+        return content
+    import re
+
+    def _repl(m):
+        inner = m.group(1).strip()
+        return f"<think>{inner}</think>" if inner else ""
+
+    content = re.sub(r"<\|channel>\w*\s*(.*?)<channel\|>", _repl, content, flags=re.DOTALL)
+    # Drop any leftover/unterminated markers (e.g. response truncated by max_tokens)
+    content = re.sub(r"<\|channel>\w*\s*", "", content)
+    content = content.replace("<channel|>", "")
+    return content.strip()
 
 
 def strip_thinking_from_content(content: str) -> str:
@@ -164,6 +292,7 @@ def strip_thinking_from_content(content: str) -> str:
     """
     if not isinstance(content, str):
         return content
+    content = normalize_reasoning_channels(content)
     lower = content.lower()
     idx = lower.find("</think>")
     if idx != -1:
@@ -250,6 +379,61 @@ CHAT_TOOLS = [
                 "required": ["path"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web and return a list of results (title, url, snippet). Use to find current information, documentation, or facts not in your training data. Follow up with fetch_url to read a result in full.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default 5)"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Fetch a web page and return its text content with HTML stripped. Use after web_search to read a result, or to read any known http(s) URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Absolute http(s) URL to fetch"
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "view_media",
+            "description": "Look at an image or video file and get a detailed text description of its visible content. Use this to inspect screenshots, photos, or video clips the user references. Accepts the same sandboxed paths as read_file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path to the image or video file"
+                    }
+                },
+                "required": ["path"]
+            }
+        }
     }
 ]
 
@@ -266,8 +450,163 @@ def is_path_allowed(file_path: str) -> bool:
     return any(resolved.is_relative_to(base) for base in TOOL_ALLOWED_PATHS)
 
 
-def execute_tool(name: str, arguments: dict) -> dict:
+def _web_search(query: str, max_results, config: dict) -> dict:
+    """Pluggable web search. Provider selected by config['search_provider'].
+
+    Supports: duckduckgo (default, needs the `ddgs` pip package), searxng
+    (config['searxng_url']), tavily (config['tavily_api_key']), brave
+    (config['brave_api_key']). Returns {query, provider, results:[{title,url,snippet}]}.
+    """
+    query = (query or "").strip()
+    if not query:
+        return {"error": "Empty search query"}
+    provider = (config.get("search_provider") or "duckduckgo").lower()
+    try:
+        n = int(max_results) if max_results else int(config.get("search_max_results", 5) or 5)
+    except (TypeError, ValueError):
+        n = 5
+    n = max(1, min(n, 25))
+
+    try:
+        if provider == "duckduckgo":
+            try:
+                from ddgs import DDGS
+            except ImportError:
+                try:
+                    from duckduckgo_search import DDGS
+                except ImportError:
+                    return {"error": "DuckDuckGo search needs the 'ddgs' package. Install with: pip install ddgs"}
+            hits = []
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=n):
+                    hits.append({
+                        "title": r.get("title", ""),
+                        "url": r.get("href", "") or r.get("url", ""),
+                        "snippet": r.get("body", "") or r.get("snippet", ""),
+                    })
+            return {"query": query, "provider": provider, "results": hits}
+
+        if provider == "searxng":
+            base = (config.get("searxng_url") or "").rstrip("/")
+            if not base:
+                return {"error": "Set 'searxng_url' in config.json to use the SearXNG provider"}
+            resp = requests.get(f"{base}/search", params={"q": query, "format": "json"}, timeout=20)
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+            hits = [{"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")}
+                    for r in results[:n]]
+            return {"query": query, "provider": provider, "results": hits}
+
+        if provider == "tavily":
+            key = config.get("tavily_api_key") or ""
+            if not key:
+                return {"error": "Set 'tavily_api_key' in config.json to use the Tavily provider"}
+            resp = requests.post("https://api.tavily.com/search",
+                                 json={"api_key": key, "query": query, "max_results": n}, timeout=30)
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+            hits = [{"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")}
+                    for r in results[:n]]
+            return {"query": query, "provider": provider, "results": hits}
+
+        if provider == "brave":
+            key = config.get("brave_api_key") or ""
+            if not key:
+                return {"error": "Set 'brave_api_key' in config.json to use the Brave provider"}
+            resp = requests.get("https://api.search.brave.com/res/v1/web/search",
+                                params={"q": query, "count": n},
+                                headers={"X-Subscription-Token": key, "Accept": "application/json"}, timeout=30)
+            resp.raise_for_status()
+            results = resp.json().get("web", {}).get("results", [])
+            hits = [{"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("description", "")}
+                    for r in results[:n]]
+            return {"query": query, "provider": provider, "results": hits}
+
+        return {"error": f"Unknown search_provider: {provider}"}
+    except Exception as e:
+        return {"error": f"web_search failed ({provider}): {e}"}
+
+
+def _fetch_url(url: str, config: dict) -> dict:
+    """Fetch a URL and return text with HTML stripped, capped to config['fetch_url_max_chars']."""
+    url = (url or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        return {"error": "url must start with http:// or https://"}
+    try:
+        max_chars = int(config.get("fetch_url_max_chars", 8000) or 8000)
+    except (TypeError, ValueError):
+        max_chars = 8000
+    try:
+        resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0 (VisionLab agent)"})
+        resp.raise_for_status()
+        text = resp.text
+        if "html" in resp.headers.get("Content-Type", "").lower():
+            import re
+            text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", text)
+            text = re.sub(r"(?s)<[^>]+>", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
+        return {"url": url, "content": text[:max_chars], "length": len(text), "truncated": len(text) > max_chars}
+    except Exception as e:
+        return {"error": f"fetch_url failed: {e}"}
+
+
+VIEW_MEDIA_INSTRUCTION = (
+    "Describe the attached media in clear, factual detail so it can be reasoned "
+    "about: subjects, setting, any visible text, actions, colors, and notable "
+    "details. For video, summarize what happens across the frames. Describe only "
+    "what is visible; do not speculate. Output only the description."
+)
+
+
+def describe_media_file(media_path: str, config: dict) -> dict:
+    """Run a VLM pass over an image/video file and return a text description.
+
+    Backs the `view_media` agent tool: tool results travel back to the model as
+    text, so the agent 'reads' media by getting a faithful description rather
+    than raw pixels.
+    """
+    media_type = get_media_type(media_path)
+    if media_type not in ("image", "video"):
+        return {"error": f"Not an image or video file: {media_path}"}
+    try:
+        media_content = prepare_media_content(
+            media_path,
+            "",                    # processing_mode: frame-sample video (not Native Video)
+            "interval",            # sampling_mode
+            2.0,                   # interval (seconds between sampled frames)
+            1.0,                   # target_fps (unused in interval mode)
+            8,                     # max_frames_limit
+            640, 480,              # frame size for video; ignored for native images
+            "Native Resolution",   # images full-res; video frames at 640x480
+        )
+        if not media_content:
+            return {"error": "Could not prepare media content"}
+        payload = {
+            "model": config["model_name"],
+            "messages": [
+                {"role": "system", "content": VIEW_MEDIA_INSTRUCTION},
+                {"role": "user", "content": [{"type": "text", "text": "Describe this media."}] + media_content},
+            ],
+            "max_tokens": int(config.get("observation_max_tokens", 1024)),
+            "temperature": float(config.get("observation_temperature", 0.4)),
+            "stream": False,
+        }
+        resp = requests.post(config["api_url"], json=payload, timeout=300)
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data["choices"][0]["message"].get("content", "") or ""
+        return {
+            "path": media_path,
+            "media_type": media_type,
+            "description": strip_thinking_from_content(raw).strip(),
+        }
+    except Exception as e:
+        return {"error": str(e)[:500]}
+
+
+def execute_tool(name: str, arguments: dict, config: Optional[dict] = None) -> dict:
     """Execute a tool call and return the result."""
+    config = config or {}
     if name == "read_file":
         path = arguments["path"]
         if not is_path_allowed(path):
@@ -314,6 +653,23 @@ def execute_tool(name: str, arguments: dict) -> dict:
         except Exception as e:
             return {"error": f"Failed to list {path}: {e}"}
 
+    elif name == "view_media":
+        path = arguments["path"]
+        if not is_path_allowed(path):
+            return {"error": f"Access denied: {path} is outside allowed directories"}
+        p = Path(path)
+        if not p.exists():
+            return {"error": f"File not found: {path}"}
+        if not p.is_file():
+            return {"error": f"Not a file: {path}"}
+        return describe_media_file(str(p), config)
+
+    elif name == "web_search":
+        return _web_search(arguments.get("query", ""), arguments.get("max_results"), config)
+
+    elif name == "fetch_url":
+        return _fetch_url(arguments.get("url", ""), config)
+
     return {"error": f"Unknown tool: {name}"}
 
 
@@ -342,8 +698,11 @@ class ChatRequest(BaseModel):
     seed: int = -1
     # Qwen3.5 thinking mode
     enable_thinking: bool = False
+    # Two-pass observation override (per-request; falls back to config.json default)
+    enable_observation_pass: Optional[bool] = None
     # Mode settings
     interaction_mode: str = "Free-form"
+    active_character: str = ""
     system_prompt: str = ""
     inject_thinking: bool = False
     custom_mode: bool = False
@@ -403,8 +762,7 @@ def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, 'r') as f:
-                merged = {**DEFAULT_CONFIG, **json.load(f)}
-            return resolve_active_mode(merged)
+                return {**DEFAULT_CONFIG, **json.load(f)}
         except:
             return DEFAULT_CONFIG.copy()
     return DEFAULT_CONFIG.copy()
@@ -545,12 +903,17 @@ def extract_frames_manual(video_path: str, sampling_mode: str, interval: float,
 def build_system_message(interaction_mode: str, system_prompt: str, thought_syntax: str, 
                          inject_thinking: bool, custom_mode: bool = False) -> Optional[str]:
     mode_config = INTERACTION_MODES.get(interaction_mode, INTERACTION_MODES["Free-form"])
-    
+
     if not mode_config["inject_system"]:
+        # Free-form: passthrough, but inject the mode's text_prompt (and the
+        # custom preamble) when present.
+        parts = []
         if custom_mode:
-            return CUSTOM_INSTRUCTIONS.strip()
-        return None
-    
+            parts.append(CUSTOM_INSTRUCTIONS.strip())
+        if system_prompt:
+            parts.append(system_prompt)
+        return "\n\n".join(parts) if parts else None
+
     thinking_instruction = ""
     if inject_thinking and mode_config["inject_thinking"] and thought_syntax and "{content}" in thought_syntax:
         open_tag = thought_syntax.split("{content}")[0]
@@ -651,6 +1014,89 @@ def calculate_token_estimate(media_info: dict, target_fps: float, image_width: i
         "limit_source": limit_source,
         "media_type": media_type
     }
+
+
+# ---------- TTS proxy ----------
+class TTSRequest(BaseModel):
+    text: str
+    voice: Optional[str] = None
+    model: Optional[str] = None
+    ref_audio: Optional[str] = None
+    instruct: Optional[str] = None
+    speed: Optional[float] = None
+    response_format: str = "wav"
+
+
+@app.post("/api/tts")
+async def tts_proxy(req: TTSRequest):
+    """Synthesize speech via the configured TTS server. Proxies to keep
+    secrets/config out of the frontend and to apply server-side defaults
+    (voice, ref_audio, etc.) from config.json.
+    """
+    config = load_config()
+    if not config.get("tts_enabled", False):
+        raise HTTPException(status_code=400, detail="TTS is disabled in config (tts_enabled=false)")
+
+    text = req.text or ""
+    if config.get("tts_strip_thinking", True):
+        text = strip_thinking_from_content(text).strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text after stripping thinking blocks")
+
+    # Build payload — request fields override config defaults
+    payload = {
+        "model": req.model or config.get("tts_model", "omnivoice"),
+        "input": text,
+        "voice": req.voice or config.get("tts_voice", "F2"),
+        "speed": req.speed if req.speed is not None else float(config.get("tts_speed", 1.0)),
+        "response_format": req.response_format,
+    }
+    ref = req.ref_audio if req.ref_audio is not None else config.get("tts_ref_audio", "")
+    if ref:
+        payload["ref_audio"] = ref
+    instr = req.instruct if req.instruct is not None else config.get("tts_instruct", "")
+    if instr:
+        payload["instruct"] = instr
+
+    url = config.get("tts_url", "http://localhost:8800/v1/audio/speech")
+    try:
+        # Long timeout — synthesis on long messages can take 30-60s
+        upstream = requests.post(url, json=payload, timeout=300, stream=True)
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"TTS server unreachable at {url}: {e}")
+
+    if upstream.status_code != 200:
+        raise HTTPException(
+            status_code=upstream.status_code,
+            detail=f"TTS upstream error: {upstream.text[:500]}",
+        )
+
+    mime = {"wav": "audio/wav", "mp3": "audio/mpeg", "flac": "audio/flac"}.get(
+        req.response_format, "audio/wav"
+    )
+
+    def iter_audio():
+        for chunk in upstream.iter_content(chunk_size=8192):
+            if chunk:
+                yield chunk
+
+    return StreamingResponse(iter_audio(), media_type=mime)
+
+
+@app.get("/api/tts/health")
+async def tts_health():
+    """Probe the configured TTS server for readiness."""
+    config = load_config()
+    if not config.get("tts_enabled", False):
+        return {"enabled": False, "status": "disabled"}
+    url = config.get("tts_url", "http://localhost:8800/v1/audio/speech")
+    base = url.rsplit("/v1/", 1)[0]
+    try:
+        r = requests.get(f"{base}/health", timeout=3)
+        return {"enabled": True, "status": "ready" if r.ok else "error",
+                 "upstream": r.json() if r.ok else r.text[:200]}
+    except Exception as e:
+        return {"enabled": True, "status": "unreachable", "error": str(e)}
 
 
 # API Endpoints
@@ -812,45 +1258,24 @@ async def update_config(update: ConfigUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/modes")
-async def get_modes():
-    """List all interaction-mode profiles from config/modes.yaml.
-
-    Returns {mode_name: {description, interaction_mode, inject_thinking,
-    has_system_prompt}, ...} — the system_prompt body is omitted from the
-    listing to keep the payload small. Fetch /api/modes/{name} for the
-    full body.
-    """
-    modes = load_modes().get("modes", {})
-    listing = {}
-    for name, entry in modes.items():
-        if not isinstance(entry, dict):
-            continue
-        sp = entry.get("system_prompt", "") or ""
-        listing[name] = {
-            "description": entry.get("description", ""),
-            "interaction_mode": entry.get("interaction_mode", ""),
-            "inject_thinking": bool(entry.get("inject_thinking", False)),
-            "has_system_prompt": bool(sp.strip()),
-            "system_prompt_length": len(sp),
-        }
-    return {"modes": listing}
+@app.get("/api/ui-modes")
+async def get_ui_modes():
+    """Return the full UI-agent prompt set (values included) for the editor."""
+    return load_modes()
 
 
-@app.get("/api/modes/{name}")
-async def get_mode(name: str):
-    """Fetch a single mode profile by name — full system_prompt included."""
-    modes = load_modes().get("modes", {})
-    mode = modes.get(name)
-    if not isinstance(mode, dict):
-        raise HTTPException(status_code=404, detail=f"Mode not found: {name}")
-    return {
-        "name": name,
-        "description": mode.get("description", ""),
-        "interaction_mode": mode.get("interaction_mode", ""),
-        "inject_thinking": bool(mode.get("inject_thinking", False)),
-        "system_prompt": mode.get("system_prompt", "") or "",
-    }
+class UiModesUpdate(BaseModel):
+    ui_modes: Dict[str, Any]
+
+
+@app.post("/api/ui-modes")
+async def save_ui_modes(update: UiModesUpdate):
+    """Persist the full ui_modes object back to config/modes.yaml."""
+    try:
+        save_modes({"ui_modes": update.ui_modes})
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/models")
@@ -1021,37 +1446,28 @@ def _save_thinking_from_response(full_text: str):
 async def chat_endpoint(request: ChatRequest, http_request: Request):
     """Streaming chat endpoint"""
     config = load_config()
-    prompts = load_prompts()
-    
+
     async def generate():
         try:
             # Build messages for API
             api_messages = []
             
-            # Determine system prompt based on interaction mode:
-            # - Free-form: use chat_assistant.system_prompt directly
-            # - Roleplay:  use roleplay.system_prompt (falls back to request.system_prompt, then chat_assistant)
-            # - Analytical: use request.system_prompt or chat_assistant fallback
-            chat_system = prompts.get("chat_assistant", {}).get("system_prompt", "")
-            roleplay_system = prompts.get("roleplay", {}).get("system_prompt", "")
+            # Resolve the system prompt from the UI agent's mode (config/modes.yaml).
+            # A non-empty request.system_prompt (session override) wins; otherwise
+            # the active mode's text_prompt is used (Roleplay: the selected character).
+            mode_bundle = resolve_ui_mode(request.interaction_mode, request.active_character)
+            text_prompt = request.system_prompt or mode_bundle["text_prompt"]
 
             if not request.messages or request.messages[0].role != "system":
-                if chat_system and request.interaction_mode == "Free-form":
-                    api_messages.append({"role": "system", "content": chat_system})
-                else:
-                    if request.interaction_mode == "Roleplay":
-                        resolved_prompt = roleplay_system or request.system_prompt or chat_system
-                    else:
-                        resolved_prompt = request.system_prompt or chat_system
-                    system_msg = build_system_message(
-                        request.interaction_mode,
-                        resolved_prompt,
-                        request.thought_syntax,
-                        request.inject_thinking,
-                        request.custom_mode
-                    )
-                    if system_msg:
-                        api_messages.append({"role": "system", "content": system_msg})
+                system_msg = build_system_message(
+                    request.interaction_mode,
+                    text_prompt,
+                    request.thought_syntax,
+                    request.inject_thinking,
+                    request.custom_mode
+                )
+                if system_msg:
+                    api_messages.append({"role": "system", "content": system_msg})
             
             # Process messages, stripping thinking blocks from assistant history
             for msg in request.messages:
@@ -1087,6 +1503,112 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
                             api_messages[i]["content"].extend(media_content)
                         break
             
+            # Determine whether the two-pass observation is active this turn.
+            obs_enabled = (request.enable_observation_pass
+                            if request.enable_observation_pass is not None
+                            else config.get("enable_observation_pass", False))
+
+            # Media scaffold (Observe OFF): prepend the mode's per-media-type
+            # instruction to the user's turn when media is attached.
+            if request.include_media and request.media_path and not obs_enabled:
+                scaffold = (mode_bundle["media_video"]
+                            if is_video_file(request.media_path)
+                            else mode_bundle["media_image"])
+                if scaffold:
+                    for i in range(len(api_messages) - 1, -1, -1):
+                        if api_messages[i]["role"] == "user":
+                            c = api_messages[i]["content"]
+                            if isinstance(c, str):
+                                api_messages[i]["content"] = f"{scaffold}\n\n{c}" if c else scaffold
+                            elif isinstance(c, list):
+                                merged = False
+                                for part in c:
+                                    if isinstance(part, dict) and part.get("type") == "text":
+                                        part["text"] = f"{scaffold}\n\n{part.get('text', '')}".strip()
+                                        merged = True
+                                        break
+                                if not merged:
+                                    c.insert(0, {"type": "text", "text": scaffold})
+                            break
+
+            # ---- Two-pass observation (when enabled + media attached) ----
+            # Pass A: short focused observation of the media. Output is injected
+            # as silent context into pass B's system message. Optionally surfaced
+            # to the UI as a collapsible block.
+            observation_text: Optional[str] = None
+            if (obs_enabled and request.include_media and request.media_path):
+                try:
+                    # Prompts never come from backend/config.json. Use the active
+                    # mode's observation_prompt (modes.yaml); fall back to the
+                    # hardcoded DEFAULT_CONFIG value so a stale config.json can't
+                    # inject a prompt here.
+                    obs_instruction = mode_bundle["observation_prompt"] or DEFAULT_CONFIG.get("observation_prompt", "")
+                    obs_messages = [
+                        {"role": "system", "content": obs_instruction},
+                    ]
+                    # Re-prepare the same media for the observation pass
+                    obs_media = prepare_media_content(
+                        request.media_path,
+                        request.processing_mode,
+                        request.sampling_mode,
+                        request.interval,
+                        request.target_fps,
+                        request.max_frames_limit,
+                        request.image_width,
+                        request.image_height,
+                        request.resolution_mode,
+                    )
+                    obs_messages.append({
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Observe and report."}] + obs_media,
+                    })
+
+                    obs_payload = {
+                        "model": config["model_name"],
+                        "messages": obs_messages,
+                        "max_tokens": int(config.get("observation_max_tokens", 1024)),
+                        "temperature": float(config.get("observation_temperature", 0.4)),
+                        "top_p": request.top_p,
+                        "stream": False,
+                    }
+                    # Match video FPS handling from main payload
+                    if is_video_file(request.media_path) and request.force_fps:
+                        obs_payload["mm_processor_kwargs"] = {"fps": request.video_fps}
+
+                    obs_resp = requests.post(config["api_url"], json=obs_payload, timeout=300)
+                    obs_resp.raise_for_status()
+                    obs_data = obs_resp.json()
+                    raw_obs = obs_data["choices"][0]["message"].get("content", "") or ""
+                    observation_text = strip_thinking_from_content(raw_obs).strip()
+
+                    # Surface observation to frontend as a distinct event so the UI
+                    # can render it in a collapsible block under the response
+                    if observation_text:
+                        yield f"data: {json.dumps({'observation': observation_text})}\n\n"
+
+                        # Inject as silent context into the system message of pass B
+                        obs_context = f"\n\n[VISUAL OBSERVATION — silent context, do not repeat verbatim in your response]\n{observation_text}\n[/VISUAL OBSERVATION]"
+                        if api_messages and api_messages[0]["role"] == "system":
+                            api_messages[0]["content"] += obs_context
+                        else:
+                            api_messages.insert(0, {"role": "system", "content": obs_context.strip()})
+
+                        # Optionally drop the media from pass B to save tokens —
+                        # observation already extracted what's there
+                        if not config.get("observation_include_media_in_pass_b", True):
+                            for i in range(len(api_messages) - 1, -1, -1):
+                                if api_messages[i]["role"] == "user" and isinstance(api_messages[i]["content"], list):
+                                    api_messages[i]["content"] = [
+                                        c for c in api_messages[i]["content"] if c.get("type") == "text"
+                                    ]
+                                    # Collapse back to plain string if only one text block
+                                    if len(api_messages[i]["content"]) == 1:
+                                        api_messages[i]["content"] = api_messages[i]["content"][0].get("text", "")
+                                    break
+                except Exception as obs_err:
+                    # Pass A failure must never break pass B — surface as warning event
+                    yield f"data: {json.dumps({'observation_error': str(obs_err)[:500]})}\n\n"
+
             # Inject pane context into the existing system message (Qwen3.5 only allows one system msg at index 0)
             if request.pane_context:
                 context_text = f"\n\n[WORKSPACE CONTEXT] The user is currently working in the following view:\n{request.pane_context}\nUse this context to provide relevant assistance."
@@ -1133,9 +1655,11 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
 
                     # If the model wants to call tools
                     if finish_reason == "tool_calls" or message.get("tool_calls"):
-                        # Emit any text content the model produced alongside tool calls
-                        if message.get("content"):
-                            yield f"data: {json.dumps({'content': message['content']})}\n\n"
+                        # Emit any text content (and reasoning, wrapped) the model produced alongside tool calls
+                        reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+                        tool_pre = (f"<think>{reasoning}</think>" if reasoning else "") + normalize_reasoning_channels(message.get("content") or "")
+                        if tool_pre:
+                            yield f"data: {json.dumps({'content': tool_pre})}\n\n"
 
                         # Add assistant message (with tool_calls) to conversation
                         api_messages.append(message)
@@ -1151,7 +1675,7 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
                             yield f"data: {json.dumps({'tool_call': {'id': tc['id'], 'name': tool_name, 'arguments': tool_args}})}\n\n"
 
                             # Execute the tool
-                            tool_result = execute_tool(tool_name, tool_args)
+                            tool_result = execute_tool(tool_name, tool_args, config)
 
                             # Notify frontend of result
                             yield f"data: {json.dumps({'tool_result': {'id': tc['id'], 'name': tool_name, 'result': tool_result}})}\n\n"
@@ -1165,10 +1689,13 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
 
                         continue  # next round — model sees tool results
 
-                    # No tool calls — model produced a final text response
-                    if message.get("content"):
-                        yield f"data: {json.dumps({'content': message['content']})}\n\n"
-                        _save_thinking_from_response(message["content"])
+                    # No tool calls — model produced a final text response.
+                    # Re-wrap reasoning so frontend regex and thinking_logs save work.
+                    reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+                    final = (f"<think>{reasoning}</think>" if reasoning else "") + normalize_reasoning_channels(message.get("content") or "")
+                    if final:
+                        yield f"data: {json.dumps({'content': final})}\n\n"
+                        _save_thinking_from_response(final)
                     yield f"data: [DONE]\n\n"
                     return  # exit generate()
 
@@ -1203,6 +1730,7 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
             threading.Thread(target=_stream_lines, daemon=True).start()
 
             accumulated = []
+            think_open = False  # tracks whether a <think> block is currently open in the stream
             try:
                 while True:
                     if await http_request.is_disconnected():
@@ -1225,8 +1753,25 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
                         try:
                             chunk = json.loads(decoded)
                             if 'choices' in chunk and len(chunk['choices']) > 0:
-                                content = chunk['choices'][0].get('delta', {}).get('content', '')
+                                delta = chunk['choices'][0].get('delta', {})
+                                # vLLM's qwen3 reasoning parser routes thinking into a separate
+                                # `reasoning` field (older variants use `reasoning_content`).
+                                # Re-wrap it inline in <think>…</think> so the frontend, the
+                                # thinking_logs save path, and the TTS strip all keep working.
+                                reasoning = delta.get('reasoning') or delta.get('reasoning_content') or ''
+                                content = delta.get('content') or ''
+                                if reasoning:
+                                    if not think_open:
+                                        think_open = True
+                                        accumulated.append('<think>')
+                                        yield f"data: {json.dumps({'content': '<think>'})}\n\n"
+                                    accumulated.append(reasoning)
+                                    yield f"data: {json.dumps({'content': reasoning})}\n\n"
                                 if content:
+                                    if think_open:
+                                        think_open = False
+                                        accumulated.append('</think>')
+                                        yield f"data: {json.dumps({'content': '</think>'})}\n\n"
                                     accumulated.append(content)
                                     yield f"data: {json.dumps({'content': content})}\n\n"
                         except json.JSONDecodeError:
@@ -1541,11 +2086,114 @@ async def rerun_caption(req: RecaptionRequest):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
+# --- Lazy media captioning (durable "visual memory" for chat history) ---
+
+# Neutral, factual summarization wrapper. Defined in source (never config.json)
+# so a stale config can't inject a prompt here. The active mode's media prompt
+# (modes.yaml) is prepended as interpretation framing when requested.
+MEDIA_MEMORY_INSTRUCTION = (
+    "You are writing a durable visual memory note. The media will soon leave the "
+    "conversation, and this summary will be the ONLY record that remains of it. "
+    "Write a concise, factual description (3-5 sentences) capturing the key visible "
+    "elements: subjects, setting, actions, and any notable detail later turns might "
+    "reference. Describe only what is visible; do not speculate or answer questions. "
+    "Output only the summary text."
+)
+
+
+class CaptionMediaRequest(BaseModel):
+    media_id: str
+    interaction_mode: str = "Free-form"
+    active_character: str = ""
+    include_mode_framing: bool = True
+    # Media processing params (mirror the chat request so the caption sees the
+    # same representation the model originally saw).
+    processing_mode: str = ""
+    sampling_mode: str = ""
+    interval: float = 0
+    target_fps: float = 0
+    max_frames_limit: int = 0
+    image_width: int = 0
+    image_height: int = 0
+    resolution_mode: str = ""
+    video_fps: float = 0
+    force_fps: bool = False
+    max_tokens: int = 0
+
+
+@app.post("/api/caption-media")
+async def caption_media(req: CaptionMediaRequest):
+    """Generate a durable text caption for an uploaded media item (by id).
+
+    Used to collapse media to a 'visual memory' note once it falls out of the
+    image window in chat history. Non-streaming: returns {"caption": str}.
+    """
+    config = load_config()
+
+    # Resolve media_id -> file in uploads/ (same lookup as /api/media/{id})
+    file_path: Optional[Path] = None
+    for f in UPLOAD_DIR.iterdir():
+        if f.stem == req.media_id:
+            file_path = f
+            break
+    if file_path is None:
+        return {"error": f"Media not found: {req.media_id}"}
+
+    media_path = str(file_path)
+    is_video = is_video_file(media_path)
+
+    # Interpretation framing from the active mode (modes.yaml), never config.json.
+    instruction = MEDIA_MEMORY_INSTRUCTION
+    if req.include_mode_framing:
+        mode_bundle = resolve_ui_mode(req.interaction_mode, req.active_character)
+        framing = mode_bundle["media_video"] if is_video else mode_bundle["media_image"]
+        if framing:
+            instruction = f"{framing}\n\n{MEDIA_MEMORY_INSTRUCTION}"
+
+    try:
+        media_content = prepare_media_content(
+            media_path,
+            req.processing_mode,
+            req.sampling_mode,
+            req.interval,
+            req.target_fps,
+            req.max_frames_limit,
+            req.image_width,
+            req.image_height,
+            req.resolution_mode,
+        )
+        if not media_content:
+            return {"error": "Could not prepare media content"}
+
+        payload = {
+            "model": config["model_name"],
+            "messages": [
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": [{"type": "text", "text": "Summarize this media."}] + media_content},
+            ],
+            "max_tokens": int(req.max_tokens or config.get("observation_max_tokens", 1024)),
+            "temperature": float(config.get("observation_temperature", 0.4)),
+            "stream": False,
+        }
+        if is_video and req.force_fps:
+            payload["mm_processor_kwargs"] = {"fps": req.video_fps}
+
+        resp = requests.post(config["api_url"], json=payload, timeout=300)
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data["choices"][0]["message"].get("content", "") or ""
+        caption = strip_thinking_from_content(raw).strip()
+        return {"caption": caption}
+    except Exception as e:
+        return {"error": str(e)[:500]}
+
+
 # --- Chat Log Endpoints ---
 
 class SaveChatRequest(BaseModel):
     messages: List[Dict[str, Any]]
     title: Optional[str] = None
+    sampling: Optional[Dict[str, Any]] = None
 
 
 @app.post("/api/chat/save")
@@ -1564,6 +2212,8 @@ async def save_chat_log(request: SaveChatRequest):
         "message_count": len(request.messages),
         "messages": request.messages,
     }
+    if request.sampling:
+        log_data["sampling"] = request.sampling
     filepath.write_text(json.dumps(log_data, indent=2, ensure_ascii=False), encoding="utf-8")
     return {"status": "saved", "path": str(filepath), "filename": filename}
 
@@ -1584,6 +2234,36 @@ async def list_chat_logs():
         except Exception:
             continue
     return {"logs": logs}
+
+
+def _safe_chat_log_path(filename: str) -> Path:
+    """Resolve a chat-log filename to a path inside CHAT_LOGS_DIR (no traversal)."""
+    candidate = (CHAT_LOGS_DIR / filename).resolve()
+    if candidate.parent != CHAT_LOGS_DIR.resolve() or candidate.suffix != ".json":
+        raise HTTPException(status_code=400, detail="Invalid log filename")
+    return candidate
+
+
+@app.get("/api/chat/logs/{filename}")
+async def load_chat_log(filename: str):
+    """Load a saved conversation (messages + metadata) for reloading into the UI."""
+    filepath = _safe_chat_log_path(filename)
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Log not found")
+    try:
+        return json.loads(filepath.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/chat/logs/{filename}")
+async def delete_chat_log(filename: str):
+    """Delete a saved conversation log."""
+    filepath = _safe_chat_log_path(filename)
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Log not found")
+    filepath.unlink()
+    return {"status": "deleted", "filename": filename}
 
 
 # --- Batch Captioning ---
