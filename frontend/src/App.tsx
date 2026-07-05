@@ -27,7 +27,7 @@ import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import {
   Upload, Settings, Cpu, MessageSquare, Send, Trash2,
   ChevronDown, ChevronRight, RefreshCw, Paperclip, X,
-  Scissors, Check, Zap, Eye, Brain, Film, Camera,
+  Scissors, Check, Zap, Eye, Brain, Film, Camera, Monitor,
   FolderOpen, Save, ChevronLeft, FileText, ImageIcon, Download, RotateCcw, RotateCw, EyeOff,
   Volume2, VolumeX, Square
 } from 'lucide-react';
@@ -41,6 +41,7 @@ interface Message {
   screenshot?: string;
   observation?: string;        // pass-A observation for media-attached chat turns
   mediaCaption?: string;       // durable text caption, generated lazily when media falls out of the image window
+  autonomous?: boolean;        // assistant turn the live loop spoke unprompted (not a reply to a user message)
 }
 
 interface MediaInfo {
@@ -233,6 +234,11 @@ function App() {
 
   // Screenshot capture state
   const [pendingScreenshot, setPendingScreenshot] = useState<string | null>(null);
+  // --- Live screen sharing ---
+  const [liveSharing, setLiveSharing] = useState(false);
+  const liveStreamRef = useRef<MediaStream | null>(null);
+  const liveSharingRef = useRef(false);        // loop guard the async loop reads
+  const liveObservationRef = useRef('');       // latest obs for chat body, no stale closure
   const functionPaneRef = useRef<HTMLDivElement>(null);
 
   // Batch captioner state
@@ -298,6 +304,18 @@ function App() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  // --- Live proactive loop coordination ---
+  // messagesRef mirrors `messages` so the async loop reads fresh state without a
+  // stale closure (same trick as the live* refs). genBusyRef is a shared lock so
+  // a chat generation and an autonomous live-turn never run at once. userTurnSeqRef
+  // bumps on every send so a late live-turn can tell a user took over and bow out.
+  const messagesRef = useRef<Message[]>(messages);
+  const genBusyRef = useRef(false);
+  const liveTurnAbortRef = useRef<AbortController | null>(null);
+  const userTurnSeqRef = useRef(0);
+  const liveCooldownUntilRef = useRef(0);        // epoch ms; loop won't interject before this
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
 
   // ----- TTS helpers -----
   const stopTTS = useCallback(() => {
@@ -552,6 +570,7 @@ function App() {
 
   const streamResponse = async (apiMessages: { role: string; content: string }[], includeMedia: boolean) => {
     abortControllerRef.current = new AbortController();
+    genBusyRef.current = true;          // hold the shared lock: the live loop yields while we generate
     setIsLoading(true);
 
     try {
@@ -593,6 +612,7 @@ function App() {
           video_fps: config.target_fps,
           force_fps: chatForceFps,
           pane_context: getPaneContext() || undefined,
+          live_observation: liveSharing ? (liveObservationRef.current || undefined) : undefined,
           tools_enabled: enableTools,
           save_thinking: true
         }),
@@ -699,6 +719,7 @@ function App() {
       }
     } finally {
       setIsLoading(false);
+      genBusyRef.current = false;        // release the shared lock; live loop may resume
       abortControllerRef.current = null;
       setMessages(prev => {
         autoSaveChat(prev);
@@ -716,6 +737,11 @@ function App() {
 
   const handleSend = async () => {
     if (!input.trim() || isLoading) return;
+
+    // User input always wins: invalidate any in-flight autonomous live-turn (it
+    // self-discards on a changed sequence) and abort its request immediately.
+    userTurnSeqRef.current++;
+    liveTurnAbortRef.current?.abort();
 
     const userMessage = input.trim();
     const includeMedia = !!(media && media.id !== lastSentMedia);
@@ -836,6 +862,7 @@ function App() {
         content: m.content,
         has_media: m.hasMedia || false,
         has_screenshot: !!m.screenshot,
+        autonomous: m.autonomous || false,
       })),
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -849,6 +876,8 @@ function App() {
 
   const handleStop = () => {
     abortControllerRef.current?.abort();
+    liveTurnAbortRef.current?.abort();
+    genBusyRef.current = false;        // free the lock so the live loop can resume
     setIsLoading(false);
   };
 
@@ -880,6 +909,7 @@ function App() {
         screenshot: m.screenshot,
         observation: m.observation,
         mediaCaption: m.mediaCaption,
+        autonomous: m.autonomous,
       }));
       setMessages(restored);
       setLastSentMedia(null);   // uploaded media can't be re-attached; screenshots/observations are restored
@@ -1484,6 +1514,138 @@ function App() {
   };
 
   const clearScreenshot = () => setPendingScreenshot(null);
+
+  // --- Live screen sharing ---
+  // Hold a getDisplayMedia stream open and run the proactive loop: each cycle
+  // captures a short frame-burst and sends it (with a bounded slice of the
+  // conversation) to /api/live-turn, which returns OBS (rolling silent context,
+  // rides along with chat as `live_observation`) + SAY (an optional unprompted
+  // interjection). User turns always win via the shared genBusyRef lock.
+  const captureFrameFromStream = async (stream: MediaStream): Promise<string | null> => {
+    const track = stream.getVideoTracks()[0];
+    if (!track || track.readyState !== 'live') return null;
+    try {
+      const imageCapture = new (window as any).ImageCapture(track);
+      const bitmap = await imageCapture.grabFrame();
+      const canvas = document.createElement('canvas');
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      canvas.getContext('2d')!.drawImage(bitmap, 0, 0);
+      return canvas.toDataURL('image/jpeg', 0.7);
+    } catch {
+      return null;
+    }
+  };
+
+  const stopLiveShare = () => {
+    liveSharingRef.current = false;
+    setLiveSharing(false);
+    liveStreamRef.current?.getTracks().forEach(t => t.stop());
+    liveStreamRef.current = null;
+  };
+
+  const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+  // Grab a short chronological burst of frames — a "clip" the model reads as
+  // motion (important for watching video). ~n frames spread across spanMs.
+  const captureBurst = async (stream: MediaStream, n: number, spanMs: number): Promise<string[]> => {
+    const frames: string[] = [];
+    const gap = n > 1 ? Math.floor(spanMs / (n - 1)) : 0;
+    for (let i = 0; i < n; i++) {
+      const f = await captureFrameFromStream(stream);
+      if (f) frames.push(f);
+      if (i < n - 1 && liveSharingRef.current) await delay(gap);
+    }
+    return frames;
+  };
+
+  // Push an UNPROMPTED assistant turn (the model "spoke" on its own) into chat.
+  const appendAutonomousTurn = (text: string) => {
+    const idx = messagesRef.current.length;          // index the new turn will land at
+    setMessages(prev => {
+      const next: Message[] = [...prev, { role: 'assistant', content: text, autonomous: true }];
+      autoSaveChat(next);
+      return next;
+    });
+    if (enableTTS) speakText(text, idx);
+  };
+
+  // Tuning (mirrors backend DEFAULT_CONFIG live_* keys).
+  const LIVE_CONTEXT_TURNS = 6;        // recent messages the loop is allowed to send
+  const LIVE_CLIP_FRAMES = 8;          // frames per clip
+  const LIVE_CLIP_SPAN_MS = 3500;      // clip duration window
+  const LIVE_COOLDOWN_MS = 15000;      // min gap between unprompted interjections
+
+  // The proactive live loop. Each cycle: yield if a generation is running, grab a
+  // clip, then one merged /api/live-turn call returns OBS (silent context) + SAY
+  // (interject or [SILENT]). User turns always win — see the seq/lock checks.
+  const runLiveLoop = async () => {
+    while (liveSharingRef.current && liveStreamRef.current) {
+      // Yield to any in-flight generation (user chat, or a prior live-turn).
+      if (genBusyRef.current) { await delay(400); continue; }
+
+      // Capture first (cheap, no model call). A user may send during this.
+      const frames = await captureBurst(liveStreamRef.current, LIVE_CLIP_FRAMES, LIVE_CLIP_SPAN_MS);
+      if (!liveSharingRef.current) break;          // stopped mid-capture
+      if (frames.length === 0) break;              // track ended/lost
+      if (genBusyRef.current) continue;            // a user send slipped in during capture
+
+      // Claim the lock and record which user-turn era we belong to.
+      genBusyRef.current = true;
+      const seq = userTurnSeqRef.current;
+      liveTurnAbortRef.current = new AbortController();
+      try {
+        const recent = messagesRef.current.slice(-LIVE_CONTEXT_TURNS).map(m => ({
+          role: m.role,
+          content: m.content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim().slice(0, 500),
+        }));
+        const res = await fetch('/api/live-turn', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            frames,
+            recent_messages: recent,
+            interaction_mode: config.interaction_mode,
+            active_character: config.active_character,
+          }),
+          signal: liveTurnAbortRef.current.signal,
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.observation) liveObservationRef.current = data.observation;
+          // Speak only if: the model chose to, no user turn started meanwhile,
+          // and we're past the cooldown.
+          const fresh = userTurnSeqRef.current === seq;
+          const cooled = Date.now() >= liveCooldownUntilRef.current;
+          if (data.interjection && fresh && cooled) {
+            appendAutonomousTurn(data.interjection);
+            liveCooldownUntilRef.current = Date.now() + LIVE_COOLDOWN_MS;
+          }
+        }
+      } catch {
+        // aborted (user took over) or transient — just continue
+      } finally {
+        // Release ONLY if a user turn didn't seize the lock during our request;
+        // otherwise streamResponse now owns it and will release it itself.
+        if (userTurnSeqRef.current === seq) genBusyRef.current = false;
+        liveTurnAbortRef.current = null;
+      }
+    }
+  };
+
+  const startLiveShare = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      liveStreamRef.current = stream;
+      // Stop cleanly if the user ends sharing from the browser's own control bar
+      stream.getVideoTracks()[0]?.addEventListener('ended', stopLiveShare);
+      liveSharingRef.current = true;
+      setLiveSharing(true);
+      runLiveLoop();
+    } catch (e) {
+      console.error('Live screen share failed to start:', e);
+    }
+  };
 
   const currentPair = captionPairs[captionIndex] || null;
   const captionStats = {
@@ -3018,7 +3180,7 @@ function App() {
               </div>
             ) : (
               messages.map((msg, i) => (
-                <div key={i} className={`message ${msg.role}`}>
+                <div key={i} className={`message ${msg.role}${msg.autonomous ? ' autonomous' : ''}`}>
                   <div className="message-content">
                     {msg.role === 'assistant' ? (() => {
                       const raw = msg.content || '';
@@ -3085,6 +3247,11 @@ function App() {
                           title="Click to view full screenshot"
                         >
                           <Camera size={12} /> Screenshot attached
+                        </span>
+                      )}
+                      {msg.autonomous && (
+                        <span className="message-attachment" title="The model spoke unprompted, from your live screen">
+                          <Monitor size={12} /> Live · unprompted
                         </span>
                       )}
                       {msg.role === 'assistant' && msg.content && (
@@ -3162,6 +3329,13 @@ function App() {
                     title="Capture left pane screenshot and attach to next message"
                   >
                     <Camera size={12} /> Screenshot
+                  </button>
+                  <button
+                    className={`context-toggle ${liveSharing ? 'active' : ''}`}
+                    onClick={liveSharing ? stopLiveShare : startLiveShare}
+                    title={liveSharing ? 'Stop live screen sharing' : 'Share your screen live — the model observes it continuously'}
+                  >
+                    {liveSharing ? <><Square size={12} /> Stop Live</> : <><Monitor size={12} /> Live Screen</>}
                   </button>
                   <button
                     className={`context-toggle ${enablePaneContext ? 'active' : ''}`}

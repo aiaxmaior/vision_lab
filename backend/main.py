@@ -120,6 +120,28 @@ DEFAULT_CONFIG = {
         "what's there as if dictating into a notebook. If something is unclear due to "
         "occlusion, framing, or quality, say so plainly."
     ),
+    # --- Live proactive screen awareness (the OBS/SAY loop) ---
+    # One merged call per cycle: the model describes the screen (OBS) AND decides
+    # whether to speak up unprompted (SAY), given the recent conversation + a short
+    # frame clip. Kept short and cheap; cooldown prevents chatter.
+    "live_turn_prompt": (
+        "You are silently watching the user's screen during an ongoing conversation. "
+        "You receive the recent conversation, then a short clip (frames in chronological "
+        "order) of what is on screen right now. Do two things:\n"
+        "1) OBS: in ONE neutral sentence, state what is currently on screen.\n"
+        "2) SAY: decide if something on screen is DIRECTLY relevant to the conversation "
+        "— e.g. the user asked you to watch for something and it just happened. If and "
+        "only if it clearly matters, write ONE concise sentence (<=25 words) addressed to "
+        "the user. Otherwise write exactly: [SILENT]\n"
+        "Do not narrate generally. Do not repeat a point you already made. Only speak when "
+        "it matters. Output exactly two lines, the first starting with \"OBS:\" and the "
+        "second starting with \"SAY:\"."
+    ),
+    "live_turn_max_tokens": 96,
+    "live_turn_temperature": 0.4,
+    "live_cooldown_seconds": 15,
+    "live_clip_frames": 8,
+    "live_clip_span_ms": 3500,
     # Reference variants — copy one into `observation_prompt` above to switch.
     # The leading underscore signals "documentation / not loaded as live config."
     "_observation_prompt_examples": {
@@ -235,7 +257,7 @@ def save_modes(data: dict):
 def resolve_ui_mode(interaction_mode: str, active_character: str = "") -> dict:
     """Resolve the prompt bundle for a given interaction mode.
 
-    Returns {text_prompt, observation_prompt, media_image, media_video}.
+    Returns {text_prompt, observation_prompt, live_turn_prompt, media_image, media_video}.
     For Roleplay, the selected character's text_prompt (if any) overrides the
     mode-level text_prompt.
     """
@@ -246,6 +268,7 @@ def resolve_ui_mode(interaction_mode: str, active_character: str = "") -> dict:
     bundle = {
         "text_prompt": mode.get("text_prompt", "") or "",
         "observation_prompt": mode.get("observation_prompt", "") or "",
+        "live_turn_prompt": mode.get("live_turn_prompt", "") or "",
         "media_image": media.get("image", "") or "",
         "media_video": media.get("video", "") or "",
     }
@@ -720,6 +743,9 @@ class ChatRequest(BaseModel):
     force_fps: bool = True
     # Context injection from left pane
     pane_context: Optional[str] = None
+    # Latest live screen observation (from /api/observe-frame). Injected as
+    # situated context so the user can talk about what's on screen right now.
+    live_observation: Optional[str] = None
     # Agentic tool use
     tools_enabled: bool = False
 
@@ -739,6 +765,10 @@ class BatchCaptionRequest(BaseModel):
     strip_thinking: bool = True
     skip_existing: bool = True
     output_format: str = "json"
+    # Optional assistant-prefill: seed the model's reply with the first tokens of
+    # the caption so it continues in the right register instead of opening with a
+    # hedge/euphemism. Falls back to prompts.json batch_captioner.prefill if None.
+    caption_prefill: Optional[str] = None
 
 
 class BatchStopRequest(BaseModel):
@@ -1442,6 +1472,186 @@ def _save_thinking_from_response(full_text: str):
         filepath.write_text(thinking, encoding="utf-8")
 
 
+class ObserveFrameRequest(BaseModel):
+    # One captured frame as a data URL (data:image/jpeg;base64,...) or raw base64.
+    frame: str
+    interaction_mode: str = "Free-form"
+    active_character: str = ""
+    # Optional explicit prompt override; otherwise the active mode's
+    # observation_prompt is used (falling back to DEFAULT_CONFIG).
+    observation_prompt: Optional[str] = None
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+
+
+class LiveMsg(BaseModel):
+    role: str
+    content: str
+
+
+class LiveTurnRequest(BaseModel):
+    # Chronological burst of frames (base64 or data: URIs) — a short "clip".
+    frames: List[str]
+    interaction_mode: str = "Free-form"
+    active_character: str = ""
+    # Recent conversation, already bounded client-side; re-clamped here.
+    recent_messages: List[LiveMsg] = []
+    # Optional prompt override; else the active mode's live_turn_prompt; else DEFAULT_CONFIG.
+    live_turn_prompt: Optional[str] = None
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    # Phase 2 seam: base64 wav or data:audio/wav;base64,... (system audio burst).
+    audio: Optional[str] = None
+
+
+@app.post("/api/observe-frame")
+async def observe_frame_endpoint(req: ObserveFrameRequest):
+    """Run a single observation pass over one live-captured screen frame.
+
+    Backs live screen sharing: the frontend holds a getDisplayMedia stream open
+    and posts frames here back-to-back (paced by model latency, not a timer).
+    Returns only the observation text — no chat, no second pass — so the loop
+    stays tight. The latest observation is fed back into /api/chat as
+    `live_observation`. Pixels travel inline as base64; vLLM never touches disk,
+    so no --allowed-local-media-path is required.
+    """
+    config = load_config()
+    mode_bundle = resolve_ui_mode(req.interaction_mode, req.active_character)
+    obs_instruction = (
+        req.observation_prompt
+        or mode_bundle["observation_prompt"]
+        or DEFAULT_CONFIG.get("observation_prompt", "")
+    )
+
+    frame = req.frame.strip()
+    if not frame.startswith("data:"):
+        frame = f"data:image/jpeg;base64,{frame}"
+
+    obs_messages = [
+        {"role": "system", "content": obs_instruction},
+        {"role": "user", "content": [
+            {"type": "text", "text": "Observe and report."},
+            {"type": "image_url", "image_url": {"url": frame}},
+        ]},
+    ]
+    payload = {
+        "model": config["model_name"],
+        "messages": obs_messages,
+        "max_tokens": int(req.max_tokens or config.get("observation_max_tokens", 1024)),
+        "temperature": float(
+            req.temperature if req.temperature is not None
+            else config.get("observation_temperature", 0.4)
+        ),
+        "stream": False,
+    }
+    try:
+        resp = requests.post(config["api_url"], json=payload, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data["choices"][0]["message"].get("content", "") or ""
+        return JSONResponse({"observation": strip_thinking_from_content(raw).strip()})
+    except Exception as e:
+        return JSONResponse({"error": str(e)[:500]}, status_code=502)
+
+
+# How much recent conversation the live loop may transmit (defensive cap;
+# the client already slices before sending).
+LIVE_CONTEXT_TURNS = 6
+LIVE_MSG_CHAR_CAP = 500
+
+
+def _parse_live_output(raw: str) -> dict:
+    """Parse the two-line OBS:/SAY: contract. Fails safe to silence.
+
+    Expected:
+        OBS: <one sentence describing the screen now>
+        SAY: <one sentence to the user>   |   SAY: [SILENT]
+    A model that drops the prefixes or rambles is treated as observation-only,
+    so a malformed cycle never produces an unwanted interjection.
+    """
+    text = strip_thinking_from_content(raw).strip()
+    obs, say, found = "", "", False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.upper().startswith("OBS:"):
+            obs = s[4:].strip()
+            found = True
+        elif s.upper().startswith("SAY:"):
+            say = s[4:].strip()
+            found = True
+    if not found:
+        obs = text  # malformed — treat whole output as observation, never speak
+    silent = (not say) or say.upper().startswith("[SILENT]") or say.upper() == "SILENT"
+    return {
+        "observation": obs,
+        "interjection": None if silent else say,
+        "silent": silent,
+    }
+
+
+@app.post("/api/live-turn")
+async def live_turn_endpoint(req: LiveTurnRequest):
+    """One proactive 'watch the screen' cycle (the OBS/SAY loop).
+
+    Given a short frame-burst (a clip) plus a bounded slice of the recent
+    conversation, the model emits two lines: OBS (a one-sentence description that
+    becomes the rolling silent context) and SAY (a concise interjection, or the
+    sentinel [SILENT]). One merged call does both — the gate decision and the
+    spoken line share the same expensive multimodal prefill, so splitting them
+    would only double latency on a single-GPU server. Frames travel inline as
+    base64; no disk access. `audio` (Phase 2) is fused as Gemma 4 audio_url.
+    """
+    config = load_config()
+    mode_bundle = resolve_ui_mode(req.interaction_mode, req.active_character)
+    instruction = (
+        req.live_turn_prompt
+        or mode_bundle.get("live_turn_prompt")
+        or DEFAULT_CONFIG.get("live_turn_prompt", "")
+    )
+
+    # Bound the conversation the loop sees (client already slices; re-clamp here).
+    recent = req.recent_messages[-LIVE_CONTEXT_TURNS:]
+    transcript = "\n".join(
+        f"{m.role}: {m.content[:LIVE_MSG_CHAR_CAP]}" for m in recent
+    ) or "(no conversation yet)"
+
+    user_content = [
+        {"type": "text",
+         "text": f"Recent conversation:\n{transcript}\n\nCurrent screen clip (frames in order):"},
+    ]
+    for f in req.frames:
+        f = f.strip()
+        url = f if f.startswith("data:") else f"data:image/jpeg;base64,{f}"
+        user_content.append({"type": "image_url", "image_url": {"url": url}})
+
+    if req.audio:
+        a = req.audio.strip()
+        a_url = a if a.startswith("data:") else f"data:audio/wav;base64,{a}"
+        user_content.append({"type": "audio_url", "audio_url": {"url": a_url}})
+
+    payload = {
+        "model": config["model_name"],
+        "messages": [
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": user_content},
+        ],
+        "max_tokens": int(req.max_tokens or config.get("live_turn_max_tokens", 96)),
+        "temperature": float(
+            req.temperature if req.temperature is not None
+            else config.get("live_turn_temperature", 0.4)
+        ),
+        "stream": False,
+    }
+    try:
+        resp = requests.post(config["api_url"], json=payload, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data["choices"][0]["message"].get("content", "") or ""
+        return JSONResponse(_parse_live_output(raw))
+    except Exception as e:
+        return JSONResponse({"error": str(e)[:500]}, status_code=502)
+
+
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest, http_request: Request):
     """Streaming chat endpoint"""
@@ -1616,6 +1826,15 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
                     api_messages[0]["content"] += context_text
                 else:
                     api_messages.insert(0, {"role": "system", "content": context_text.strip()})
+
+            # Inject live screen observation (rolling context from /api/observe-frame).
+            # Same single-system-message rule as pane_context above.
+            if request.live_observation:
+                live_text = f"\n\n[LIVE SCREEN — what the user is looking at right now, updated continuously; treat as the present moment, do not repeat verbatim]\n{request.live_observation}\n[/LIVE SCREEN]"
+                if api_messages and api_messages[0]["role"] == "system":
+                    api_messages[0]["content"] += live_text
+                else:
+                    api_messages.insert(0, {"role": "system", "content": live_text.strip()})
 
             # Prepare base API payload - Qwen3.5 params go at top level, not in extra_body
             base_payload = {
@@ -2313,33 +2532,57 @@ def _strip_thinking_tags(text: str) -> tuple:
     return text, ""
 
 
+# Prepended to EVERY caption instruction (default + every target) so demographic
+# accuracy and the adult-age gate can never be accidentally missing from a prompt.
+# Two rules: describe demographics as visual ESTIMATES (not identity claims, flag
+# ambiguity), and hard-gate age (adults only; flag-and-stop on uncertain/underage).
+DEMOGRAPHICS_DIRECTIVE = (
+    "DEMOGRAPHICS — describe only apparent, visually-evident traits as ESTIMATES, "
+    "not identity claims; write 'ambiguous' rather than guessing. Cover: apparent "
+    "sex/gender presentation; apparent ethnicity or skin tone (neutral terms); body "
+    "type/build and notable proportions; hair (color, length, style); distinguishing "
+    "features (tattoos, piercings, facial hair, makeup).\n"
+    "AGE GATE — every subject must be an adult. Give an apparent adult age range "
+    "(e.g. young adult, 20s, 30s, 40s, mature). If ANY subject appears to be a minor, "
+    "or apparent age is genuinely uncertain, do NOT write a sexual caption: output "
+    "exactly '[REVIEW: age uncertain]' and nothing else.\n\n"
+)
+
+
 def _resolve_caption_instruction(is_video: bool, instruction: str, caption_target: str) -> tuple[str, int]:
     """Resolve the captioning instruction and max_tokens from target or fallback.
 
-    Returns (instruction, max_tokens_override_or_0).
+    Returns (instruction, max_tokens_override_or_0). The DEMOGRAPHICS_DIRECTIVE
+    (demographic-accuracy + adult-age gate) is prepended to whatever is resolved,
+    so it applies uniformly to the default and every target.
     """
     prompts = load_prompts()
+    resolved = None
+    tokens = 0
 
     if caption_target:
-        targets = prompts.get("caption_targets", {})
-        target = targets.get(caption_target, {})
+        target = prompts.get("caption_targets", {}).get(caption_target, {})
         if target:
             key = "video_instruction" if is_video else "image_instruction"
             target_instruction = target.get(key)
             if target_instruction:
-                final = target_instruction
+                resolved = target_instruction
                 if instruction:
-                    final += f"\n\nAdditional instructions:\n{instruction}"
-                return final, target.get("max_tokens", 0)
+                    resolved += f"\n\nAdditional instructions:\n{instruction}"
+                tokens = target.get("max_tokens", 0)
 
-    if not instruction:
-        batch_cfg = prompts.get("batch_captioner", {})
-        if is_video:
-            instruction = batch_cfg.get("video_instruction", DEFAULT_VIDEO_INSTRUCTION)
-        else:
-            instruction = batch_cfg.get("image_instruction", DEFAULT_IMAGE_INSTRUCTION)
+    if resolved is None:
+        if not instruction:
+            batch_cfg = prompts.get("batch_captioner", {})
+            if is_video:
+                # `or` (not .get's default) so a present-but-empty "" in prompts.json
+                # still falls back to the built-in default instead of an empty prompt.
+                instruction = batch_cfg.get("video_instruction") or DEFAULT_VIDEO_INSTRUCTION
+            else:
+                instruction = batch_cfg.get("image_instruction") or DEFAULT_IMAGE_INSTRUCTION
+        resolved = instruction
 
-    return instruction, 0
+    return DEMOGRAPHICS_DIRECTIVE + resolved, tokens
 
 
 def _caption_single_file(file_path: str, instruction: str, config: dict,                          req: 'BatchCaptionRequest') -> str:
@@ -2390,9 +2633,19 @@ def _caption_single_file(file_path: str, instruction: str, config: dict,        
             {"type": "text", "text": instruction},
         ]
 
+    messages = [{"role": "user", "content": content}]
+
+    # Assistant-prefill: seed the reply so the model continues in the intended
+    # explicit register instead of opening with a euphemism/hedge. Per-request
+    # value wins; else fall back to prompts.json batch_captioner.prefill.
+    prefill = req.caption_prefill
+    if prefill is None:
+        prefill = load_prompts().get("batch_captioner", {}).get("prefill", "") or ""
+    prefill = prefill.strip()
+
     payload = {
         "model": config["model_name"],
-        "messages": [{"role": "user", "content": content}],
+        "messages": messages,
         "max_tokens": req_max_tokens,
         "temperature": req.temperature,
         "top_p": req.top_p,
@@ -2408,9 +2661,18 @@ def _caption_single_file(file_path: str, instruction: str, config: dict,        
             "fps": req.video_fps,
         }
 
+    if prefill:
+        # Append the seed as a partial assistant turn and have vLLM continue it
+        # rather than start a fresh (hedge-prone) reply. The API returns only the
+        # continuation, so we prepend the seed back to rebuild the full caption.
+        messages.append({"role": "assistant", "content": prefill})
+        payload["add_generation_prompt"] = False
+        payload["continue_final_message"] = True
+
     response = requests.post(config["api_url"], json=payload, timeout=600)
     response.raise_for_status()
-    result = response.json()["choices"][0]["message"]["content"].strip()
+    continuation = response.json()["choices"][0]["message"]["content"]
+    result = ((prefill + continuation) if prefill else continuation).strip()
 
     if req.strip_thinking:
         result, thinking = _strip_thinking_tags(result)

@@ -30,6 +30,18 @@ config/modes.yaml
 results_duplicates*.json
 results_duplicates*.txt
 
+# Backups (kept locally, never committed)
+*.bak
+*.bak[0-9]
+*.bak_*
+*.bak.json
+backend/*.bk
+backend/*.bak_*
+
+# Unsanitized / sensitive prompt material
+**/unsanitized/
+backend/unsanitized_prompts_AGENTS_DONOT_TOUCH.txt
+
 # Node
 node_modules/
 npm-debug.log*

@@ -978,6 +978,13 @@ textarea.form-input {
   border-bottom-left-radius: 4px;
 }
 
+/* Autonomous (unprompted) live-loop turns: distinct dashed accent edge so it's
+   clear the model spoke on its own rather than answering a message. */
+.message.autonomous .message-content {
+  border-left: 3px dashed var(--accent-primary);
+  background: var(--bg-elevated);
+}
+
 .message-meta {
   display: flex;
   align-items: center;
