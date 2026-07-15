@@ -6,6 +6,21 @@ A context-aware, assistant-integrated interface for vision-language models. Buil
 ![React](https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=flat-square&logo=typescript)
 
+<p align="center">
+  <img src="docs/images/vision_lab_chat.jpg" alt="Vision Lab — multimodal chat and batch captioning" width="900" />
+</p>
+<p align="center"><em>Multimodal chat with media upload, free-form dialogue, and batch caption controls.</em></p>
+
+<p align="center">
+  <img src="docs/images/vision_lab_video_analysis.jpg" alt="Vision Lab — video content analysis" width="900" />
+</p>
+<p align="center"><em>Video understanding with structured action timelines and thinking-mode analysis.</em></p>
+
+<p align="center">
+  <img src="docs/images/vision_lab_live_unprompted.jpg" alt="Vision Lab — live screen context with unprompted agent response" width="900" />
+</p>
+<p align="center"><em>Live screen / OBS context: tool allowlists are enforced, and the agent can notice desktop changes and respond unprompted.</em></p>
+
 ---
 
 ## Core Capabilities
@@ -15,6 +30,7 @@ A context-aware, assistant-integrated interface for vision-language models. Buil
 - **Image attachment** support — analyze individual media files in context
 - **Thinking text parsing** — `<think>` blocks are extracted, displayed, and optionally saved to disk separately from final responses
 - **Agentic tool use** — assistant can read/write files and list directories when enabled
+- **Live screen context** — optional OBS / live desktop share; the agent can react **unprompted** when the shared view changes (tool allowlists still enforced)
 - **Dual-pane context injection** — pipe active file content or selection directly into the model context
 - **Auto chat log saving** — every session saved as timestamped JSON
 
