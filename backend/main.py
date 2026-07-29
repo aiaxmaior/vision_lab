@@ -60,6 +60,7 @@ app.add_middleware(
 CONFIG_FILE = Path(__file__).parent / "config.json"
 PROMPTS_FILE = Path(__file__).parent.parent / "config" / "prompts.json"
 MODES_FILE = Path(__file__).parent.parent / "config" / "modes.yaml"
+CUSTOM_MODE_FILE = Path(__file__).parent.parent / "config" / "custom_mode.txt"
 UPLOAD_DIR = Path(__file__).parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 CHAT_LOGS_DIR = Path(__file__).parent / "chat_logs"
@@ -218,6 +219,20 @@ def load_prompts() -> dict:
         except Exception:
             pass
     return {}
+
+
+def load_custom_instructions() -> str:
+    """Load the optional custom-mode system preamble from config/custom_mode.txt.
+
+    Local/personal file, not tracked in the repo. Returns "" when absent, in
+    which case custom mode is a no-op.
+    """
+    if CUSTOM_MODE_FILE.exists():
+        try:
+            return CUSTOM_MODE_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return ""
 
 
 UI_MODE_KEYS = {
@@ -696,7 +711,7 @@ def execute_tool(name: str, arguments: dict, config: Optional[dict] = None) -> d
     return {"error": f"Unknown tool: {name}"}
 
 
-CUSTOM_INSTRUCTIONS = ""
+CUSTOM_INSTRUCTIONS = load_custom_instructions()
 
 
 # Pydantic Models
@@ -930,7 +945,7 @@ def extract_frames_manual(video_path: str, sampling_mode: str, interval: float,
     return frames_b64
 
 
-def build_system_message(interaction_mode: str, system_prompt: str, thought_syntax: str, 
+def build_system_message(interaction_mode: str, system_prompt: str, thought_syntax: str,
                          inject_thinking: bool, custom_mode: bool = False) -> Optional[str]:
     mode_config = INTERACTION_MODES.get(interaction_mode, INTERACTION_MODES["Free-form"])
 
@@ -938,7 +953,7 @@ def build_system_message(interaction_mode: str, system_prompt: str, thought_synt
         # Free-form: passthrough, but inject the mode's text_prompt (and the
         # custom preamble) when present.
         parts = []
-        if custom_mode:
+        if custom_mode and CUSTOM_INSTRUCTIONS:
             parts.append(CUSTOM_INSTRUCTIONS.strip())
         if system_prompt:
             parts.append(system_prompt)
@@ -951,14 +966,14 @@ def build_system_message(interaction_mode: str, system_prompt: str, thought_synt
         thinking_instruction = f"\n\nUse {open_tag} and {close_tag} tags for your internal reasoning before responding."
     
     custom_prefix = CUSTOM_INSTRUCTIONS if custom_mode else ""
-    
+
     if interaction_mode == "Roleplay":
         if system_prompt:
             return custom_prefix + system_prompt + thinking_instruction
-        elif custom_mode:
+        elif custom_mode and CUSTOM_INSTRUCTIONS:
             return CUSTOM_INSTRUCTIONS.strip() + thinking_instruction
         return None
-    
+
     if interaction_mode == "Analytical":
         base = system_prompt if system_prompt else "Provide detailed, structured analysis of the media content."
         return custom_prefix + base + thinking_instruction
@@ -2532,29 +2547,10 @@ def _strip_thinking_tags(text: str) -> tuple:
     return text, ""
 
 
-# Prepended to EVERY caption instruction (default + every target) so demographic
-# accuracy and the adult-age gate can never be accidentally missing from a prompt.
-# Two rules: describe demographics as visual ESTIMATES (not identity claims, flag
-# ambiguity), and hard-gate age (adults only; flag-and-stop on uncertain/underage).
-DEMOGRAPHICS_DIRECTIVE = (
-    "DEMOGRAPHICS — describe only apparent, visually-evident traits as ESTIMATES, "
-    "not identity claims; write 'ambiguous' rather than guessing. Cover: apparent "
-    "sex/gender presentation; apparent ethnicity or skin tone (neutral terms); body "
-    "type/build and notable proportions; hair (color, length, style); distinguishing "
-    "features (tattoos, piercings, facial hair, makeup).\n"
-    "AGE GATE — every subject must be an adult. Give an apparent adult age range "
-    "(e.g. young adult, 20s, 30s, 40s, mature). If ANY subject appears to be a minor, "
-    "or apparent age is genuinely uncertain, do NOT write a sexual caption: output "
-    "exactly '[REVIEW: age uncertain]' and nothing else.\n\n"
-)
-
-
 def _resolve_caption_instruction(is_video: bool, instruction: str, caption_target: str) -> tuple[str, int]:
     """Resolve the captioning instruction and max_tokens from target or fallback.
 
-    Returns (instruction, max_tokens_override_or_0). The DEMOGRAPHICS_DIRECTIVE
-    (demographic-accuracy + adult-age gate) is prepended to whatever is resolved,
-    so it applies uniformly to the default and every target.
+    Returns (instruction, max_tokens_override_or_0).
     """
     prompts = load_prompts()
     resolved = None
@@ -2582,7 +2578,7 @@ def _resolve_caption_instruction(is_video: bool, instruction: str, caption_targe
                 instruction = batch_cfg.get("image_instruction") or DEFAULT_IMAGE_INSTRUCTION
         resolved = instruction
 
-    return DEMOGRAPHICS_DIRECTIVE + resolved, tokens
+    return resolved, tokens
 
 
 def _caption_single_file(file_path: str, instruction: str, config: dict,                          req: 'BatchCaptionRequest') -> str:

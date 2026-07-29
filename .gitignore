@@ -25,6 +25,7 @@ config/prompts.json.template
 config/prompts2.json
 config/prompts_custom_2.json
 config/modes.yaml
+config/custom_mode.txt
 
 # Generated output
 results_duplicates*.json
@@ -70,3 +71,11 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Local backups
+*.bk
+*.bak
+
+# Local research / unsanitized notes
+notes/
+config/cot_eval/
