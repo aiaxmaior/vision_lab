@@ -128,6 +128,7 @@ interface Config {
   frequency_penalty: number;
   seed: number;
   thought_syntax: string;
+  tool_call_format: string;
   vram_limit: number;
 }
 
@@ -154,12 +155,27 @@ const DEFAULT_CONFIG: Config = {
   min_p: 0.0,
   top_k: 20,
   repetition_penalty: 1.0,
-  presence_penalty: 1.5,
+  // presence/frequency are additive OpenAI-semantics penalties (-2..2), not
+  // repetition control. Non-zero frequency_penalty punishes the most-repeated
+  // tokens first — punctuation and function words — which turns long replies
+  // into comma-less run-ons. Use repetition_penalty / min_p instead.
+  presence_penalty: 0.0,
   frequency_penalty: 0.0,
   seed: -1,
   thought_syntax: "<think>{content}</think>",
+  tool_call_format: "auto",
   vram_limit: 164000
 };
+
+// How to read the model's tool calls. vLLM's --tool-call-parser is a launch flag,
+// so swapping models normally means restarting the server. Every option except
+// "server" parses the call here instead, which works whatever the flag is set to.
+const TOOL_CALL_FORMATS = [
+  { value: "auto",      label: "Auto-detect (XML or JSON)" },
+  { value: "qwen3_xml", label: "Qwen3 XML — <function=…>" },
+  { value: "hermes",    label: "Hermes JSON — {\"name\":…}" },
+  { value: "server",    label: "Server parser (vLLM flag)" },
+];
 
 interface BatchLogEntry {
   type: string;
@@ -184,9 +200,28 @@ const THOUGHT_SYNTAXES = [
 ];
 const PRESET_VALUES = THOUGHT_SYNTAXES.filter(s => s.value !== "__custom__").map(s => s.value);
 
+// Tool-call / result blocks are UI affordances that streamResponse renders into the
+// assistant bubble — they are not model output. Replaying them into history burns
+// context and teaches the model to imitate the markdown instead of calling the tool.
+// Stripped on the way out; the bubble keeps showing them.
+const stripToolTrace = (content: string): string =>
+  content
+    .replace(/\n*\*\*🔧 Tool Call:\*\*[^\n]*\n```json\n[\s\S]*?\n```\n*/g, '\n')
+    .replace(/\*\*Result:\*\*[^\n]*(?:\n {2}- \[[^\n]*)*\n*/g, '')
+    .trim();
+
+const toApiMessage = (m: Message) => ({
+  role: m.role,
+  content: m.role === 'assistant' ? stripToolTrace(m.content || '') : m.content,
+});
+
 function App() {
   // State
   const [config, setConfig] = useState<Config>(DEFAULT_CONFIG);
+  // Sticky "Custom…" selection for Thought Syntax. Needed because an empty custom
+  // string is indistinguishable from the "None" preset by value alone, so the
+  // dropdown would snap back to None the moment you cleared the field.
+  const [customThoughtSyntax, setCustomThoughtSyntax] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
@@ -438,6 +473,74 @@ function App() {
     };
   }, [isPaneResizing, handlePaneMouseMove, handlePaneMouseUp]);
 
+  // --- Caption Review column resize ---
+  // The three panels (image / pass A / pass B) were hard-coded to flex:1 each, so
+  // a caption could never use more than a third of the tab. These are flex-grow
+  // weights adjusted by the two drag handles between the panels, persisted so the
+  // layout survives a reload.
+  const CAP_FLEX_MIN = 0.25;
+  const capContentRef = useRef<HTMLDivElement>(null);
+  const capDragRef = useRef<{ startX: number; left: number; right: number; width: number; total: number } | null>(null);
+  const [capResizing, setCapResizing] = useState<'a' | 'b' | null>(null);
+  const [capFlex, setCapFlex] = useState<{ image: number; a: number; b: number }>(() => {
+    try {
+      const saved = localStorage.getItem('vl_caption_col_flex');
+      if (saved) return { image: 1, a: 1, b: 1, ...JSON.parse(saved) };
+    } catch { /* ignore malformed storage */ }
+    return { image: 1, a: 1, b: 1 };
+  });
+
+  const handleCapResizeDown = (which: 'a' | 'b') => (e: React.MouseEvent) => {
+    const el = capContentRef.current;
+    if (!el) return;
+    e.preventDefault();
+    capDragRef.current = {
+      startX: e.clientX,
+      left: which === 'a' ? capFlex.image : capFlex.a,
+      right: which === 'a' ? capFlex.a : capFlex.b,
+      width: el.getBoundingClientRect().width,
+      // Only visible panels contribute grow units, so a pixel delta converts to
+      // the right number of flex units whether or not pass B is shown.
+      total: capFlex.image + capFlex.a + (captionSubdirB ? capFlex.b : 0),
+    };
+    setCapResizing(which);
+  };
+
+  const handleCapResizeMove = useCallback((e: MouseEvent) => {
+    const d = capDragRef.current;
+    if (!capResizing || !d || d.width <= 0) return;
+    const pair = d.left + d.right;
+    const deltaFlex = ((e.clientX - d.startX) / d.width) * d.total;
+    const left = Math.max(CAP_FLEX_MIN, Math.min(pair - CAP_FLEX_MIN, d.left + deltaFlex));
+    setCapFlex(f => capResizing === 'a'
+      ? { ...f, image: left, a: pair - left }
+      : { ...f, a: left, b: pair - left });
+  }, [capResizing]);
+
+  const handleCapResizeUp = useCallback(() => {
+    setCapResizing(null);
+    capDragRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem('vl_caption_col_flex', JSON.stringify(capFlex)); } catch { /* ignore */ }
+  }, [capFlex]);
+
+  useEffect(() => {
+    if (capResizing) {
+      document.addEventListener('mousemove', handleCapResizeMove);
+      document.addEventListener('mouseup', handleCapResizeUp);
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+    }
+    return () => {
+      document.removeEventListener('mousemove', handleCapResizeMove);
+      document.removeEventListener('mouseup', handleCapResizeUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, [capResizing, handleCapResizeMove, handleCapResizeUp]);
+
   // Scroll to bottom on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -614,6 +717,7 @@ function App() {
           pane_context: getPaneContext() || undefined,
           live_observation: liveSharing ? (liveObservationRef.current || undefined) : undefined,
           tools_enabled: enableTools,
+          tool_call_format: config.tool_call_format,
           save_thinking: true
         }),
         signal: abortControllerRef.current.signal
@@ -766,11 +870,11 @@ function App() {
           role: m.role,
           content: [
             { type: 'image_url', image_url: { url: m.screenshot } },
-            { type: 'text', text: m.content },
+            { type: 'text', text: toApiMessage(m).content },
           ],
         };
       }
-      return { role: m.role, content: m.content };
+      return toApiMessage(m);
     });
 
     if (hasScreenshot) {
@@ -801,7 +905,7 @@ function App() {
     const retained = messages.slice(0, lastUserIdx + 1);
     setMessages(retained);
 
-    const apiMessages = retained.map(m => ({ role: m.role, content: m.content }));
+    const apiMessages = retained.map(toApiMessage);
     const includeMedia = !!retained[lastUserIdx].hasMedia;
 
     await streamResponse(apiMessages, includeMedia);
@@ -1178,8 +1282,11 @@ function App() {
           max_tokens: config.max_tokens,
           temperature: config.temperature,
           top_p: config.top_p,
+          min_p: config.min_p,
           top_k: config.top_k,
+          repetition_penalty: config.repetition_penalty,
           presence_penalty: config.presence_penalty,
+          frequency_penalty: config.frequency_penalty,
           enable_thinking: enableThinking,
           strip_thinking: true,
         }),
@@ -1240,8 +1347,11 @@ function App() {
           max_tokens: config.max_tokens,
           temperature: config.temperature,
           top_p: config.top_p,
+          min_p: config.min_p,
           top_k: config.top_k,
+          repetition_penalty: config.repetition_penalty,
           presence_penalty: config.presence_penalty,
+          frequency_penalty: config.frequency_penalty,
           enable_thinking: enableThinking,
           video_fps: config.target_fps,
           force_fps: batchForceFps,
@@ -1731,7 +1841,7 @@ function App() {
   };
 
   return (
-    <div className={`app-container ${isResizing || isPaneResizing ? 'resizing' : ''}`}>
+    <div className={`app-container ${isResizing || isPaneResizing || capResizing ? 'resizing' : ''}`}>
       {/* Sidebar */}
       <aside className="sidebar" style={{ width: sidebarWidth, minWidth: sidebarWidth }}>
         <div className="sidebar-header">
@@ -2144,14 +2254,14 @@ function App() {
                   </div>
 
                   <div className="form-group">
-                    <label className="form-label">Repetition Penalty</label>
+                    <label className="form-label" title="Multiplicative penalty over prompt + output. 1.0 = off; 1.05–1.10 is the useful band. Above ~1.2 it degrades coherence.">Repetition Penalty</label>
                     <div className="form-slider-container">
                       <input
                         type="range"
                         className="form-slider"
                         min="1"
                         max="2"
-                        step="0.05"
+                        step="0.01"
                         value={config.repetition_penalty}
                         onChange={(e) => setConfig(c => ({ ...c, repetition_penalty: parseFloat(e.target.value) }))}
                       />
@@ -2161,36 +2271,41 @@ function App() {
 
                   <div className="row">
                     <div className="form-group">
-                      <label className="form-label">Presence</label>
+                      <label className="form-label" title="Additive, one-shot penalty on any token already used. OpenAI semantics, 0 = off. This is NOT repetition penalty.">Presence</label>
                       <div className="form-slider-container">
                         <input
                           type="range"
                           className="form-slider"
-                          min="0"
+                          min="-2"
                           max="2"
-                          step="0.1"
+                          step="0.05"
                           value={config.presence_penalty}
                           onChange={(e) => setConfig(c => ({ ...c, presence_penalty: parseFloat(e.target.value) }))}
                         />
-                        <span className="form-slider-value">{config.presence_penalty.toFixed(1)}</span>
+                        <span className="form-slider-value">{config.presence_penalty.toFixed(2)}</span>
                       </div>
                     </div>
                     <div className="form-group">
-                      <label className="form-label">Frequency</label>
+                      <label className="form-label" title="Additive penalty scaled by how often a token was used. Above ~0.3 it starves punctuation and function words and produces run-on word salad. Leave at 0 unless you know you want it.">Frequency</label>
                       <div className="form-slider-container">
                         <input
                           type="range"
                           className="form-slider"
-                          min="0"
+                          min="-2"
                           max="2"
-                          step="0.1"
+                          step="0.05"
                           value={config.frequency_penalty}
                           onChange={(e) => setConfig(c => ({ ...c, frequency_penalty: parseFloat(e.target.value) }))}
                         />
-                        <span className="form-slider-value">{config.frequency_penalty.toFixed(1)}</span>
+                        <span className="form-slider-value">{config.frequency_penalty.toFixed(2)}</span>
                       </div>
                     </div>
                   </div>
+                  <p className="form-hint">
+                    Presence/Frequency are additive OpenAI-style penalties (0 = off). For
+                    repetition control use <strong>Repetition Penalty</strong> (1.05–1.10) and
+                    <strong> Min P</strong> (0.05); both apply on top of Top P / Top K.
+                  </p>
 
                   <div className="form-group">
                     <label className="form-label">Seed (-1 = random)</label>
@@ -2206,26 +2321,65 @@ function App() {
                     <label className="form-label">Thought Syntax</label>
                     <select
                       className="form-select"
-                      value={PRESET_VALUES.includes(config.thought_syntax) ? config.thought_syntax : "__custom__"}
+                      value={
+                        customThoughtSyntax || !PRESET_VALUES.includes(config.thought_syntax)
+                          ? "__custom__"
+                          : config.thought_syntax
+                      }
                       onChange={(e) => {
-                        if (e.target.value !== "__custom__")
-                          setConfig(c => ({ ...c, thought_syntax: e.target.value }))
+                        if (e.target.value === "__custom__") {
+                          // Custom starts empty so you can type a new model's tags.
+                          setCustomThoughtSyntax(true);
+                          setConfig(c => ({ ...c, thought_syntax: "" }));
+                        } else {
+                          // Picking a preset populates the field below with its tags.
+                          setCustomThoughtSyntax(false);
+                          setConfig(c => ({ ...c, thought_syntax: e.target.value }));
+                        }
                       }}
                     >
                       {THOUGHT_SYNTAXES.map(s => (
                         <option key={s.value} value={s.value}>{s.label}</option>
                       ))}
                     </select>
-                    {!PRESET_VALUES.includes(config.thought_syntax) && (
-                      <input
-                        type="text"
-                        className="form-input"
-                        style={{ marginTop: '6px' }}
-                        placeholder="e.g. <|think|>{content}<|/think|>"
-                        value={config.thought_syntax}
-                        onChange={(e) => setConfig(c => ({ ...c, thought_syntax: e.target.value }))}
-                      />
+                    <input
+                      type="text"
+                      className="form-input"
+                      style={{ marginTop: '6px', fontFamily: 'var(--font-mono)', fontSize: '0.8rem' }}
+                      placeholder="e.g. <|think|>{content}<|/think|>"
+                      value={config.thought_syntax}
+                      onChange={(e) => {
+                        setCustomThoughtSyntax(true);
+                        setConfig(c => ({ ...c, thought_syntax: e.target.value }));
+                      }}
+                    />
+                    {config.thought_syntax && !config.thought_syntax.includes('{content}') && (
+                      <p className="form-hint" style={{ color: 'var(--warning)', marginTop: '4px' }}>
+                        Must contain <code>{'{content}'}</code> — the backend splits on it to
+                        derive the open/close tags. Without it, thinking tags are not injected.
+                      </p>
                     )}
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label" title="How the model writes tool calls. Parsing them here means you can swap models without restarting vLLM with a different --tool-call-parser.">
+                      Tool Call Format
+                    </label>
+                    <select
+                      className="form-select"
+                      value={config.tool_call_format}
+                      onChange={(e) => setConfig(c => ({ ...c, tool_call_format: e.target.value }))}
+                    >
+                      {TOOL_CALL_FORMATS.map(f => (
+                        <option key={f.value} value={f.value}>{f.label}</option>
+                      ))}
+                    </select>
+                    <p className="form-hint" style={{ marginTop: '6px' }}>
+                      Anything but <strong>Server</strong> parses the call in Vision Lab, so tools work
+                      no matter which <code>--tool-call-parser</code> vLLM was launched with.
+                      <strong> Server</strong> trusts that flag instead — correct only when it matches
+                      the model.
+                    </p>
                   </div>
 
                   <div className="form-group">
@@ -2608,8 +2762,13 @@ function App() {
                   </p>
                 </div>
               ) : (
-                <div className="caption-review-content">
-                  <div className="caption-review-image-panel">
+                <div className="caption-review-content" ref={capContentRef}>
+                  <div
+                    className={`caption-review-image-panel ${showCaptionPreview ? '' : 'collapsed'}`}
+                    // Collapsed preview keeps the rotate/delete controls reachable
+                    // but hands the width back to the caption columns.
+                    style={showCaptionPreview ? { flex: capFlex.image } : { flex: '0 0 190px' }}
+                  >
                     {showCaptionPreview && (
                       <img
                         src={`/api/captions/image?path=${encodeURIComponent(currentPair?.image_path || '')}&v=${captionImageVersion}`}
@@ -2660,8 +2819,17 @@ function App() {
                     </button>
                   </div>
 
+                  {showCaptionPreview && (
+                    <div
+                      className={`resize-handle ${capResizing === 'a' ? 'active' : ''}`}
+                      onMouseDown={handleCapResizeDown('a')}
+                      onDoubleClick={() => setCapFlex({ image: 1, a: 1, b: 1 })}
+                      title="Drag to resize · double-click to reset"
+                    />
+                  )}
+
                   {/* Pass A */}
-                  <div className="caption-review-edit-panel">
+                  <div className="caption-review-edit-panel" style={{ flex: capFlex.a }}>
                     <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
                       <span style={{ background: 'var(--accent)', color: '#000', borderRadius: 3, padding: '1px 6px' }}>A</span>
                       {captionSubdirA || 'pass1'}
@@ -2707,7 +2875,15 @@ function App() {
 
                   {/* Pass B */}
                   {captionSubdirB && (
-                    <div className="caption-review-edit-panel">
+                    <div
+                      className={`resize-handle ${capResizing === 'b' ? 'active' : ''}`}
+                      onMouseDown={handleCapResizeDown('b')}
+                      onDoubleClick={() => setCapFlex({ image: 1, a: 1, b: 1 })}
+                      title="Drag to resize · double-click to reset"
+                    />
+                  )}
+                  {captionSubdirB && (
+                    <div className="caption-review-edit-panel" style={{ flex: capFlex.b }}>
                       <div style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--text-muted)', marginBottom: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
                         <span style={{ background: '#7c3aed', color: '#fff', borderRadius: 3, padding: '1px 6px' }}>B</span>
                         {captionSubdirB}
@@ -3181,6 +3357,38 @@ function App() {
             ) : (
               messages.map((msg, i) => (
                 <div key={i} className={`message ${msg.role}${msg.autonomous ? ' autonomous' : ''}`}>
+                  {(msg.mediaId || msg.screenshot) && (
+                    <div className="message-media">
+                      {msg.mediaId && (
+                        msg.mediaType === 'video' ? (
+                          <video
+                            src={`/api/media/${msg.mediaId}`}
+                            controls
+                            preload="metadata"
+                            // The upload can be deleted after the turn; drop the
+                            // element rather than showing a broken-media box.
+                            onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                          />
+                        ) : (
+                          <img
+                            src={`/api/media/${msg.mediaId}`}
+                            alt="Attached media"
+                            title="Click to open full size"
+                            onClick={() => window.open(`/api/media/${msg.mediaId}`, '_blank')}
+                            onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                          />
+                        )
+                      )}
+                      {msg.screenshot && (
+                        <img
+                          src={msg.screenshot}
+                          alt="Attached screenshot"
+                          title="Click to open full size"
+                          onClick={() => window.open(msg.screenshot, '_blank')}
+                        />
+                      )}
+                    </div>
+                  )}
                   <div className="message-content">
                     {msg.role === 'assistant' ? (() => {
                       const raw = msg.content || '';

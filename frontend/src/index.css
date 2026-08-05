@@ -486,6 +486,18 @@ body {
   letter-spacing: 0.5px;
 }
 
+.form-hint {
+  font-size: 0.7rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin: -4px 0 12px;
+}
+
+.form-hint strong {
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
 .form-input {
   width: 100%;
   padding: 10px 14px;
@@ -985,6 +997,45 @@ textarea.form-input {
   background: var(--bg-elevated);
 }
 
+/* Media the user attached to a turn, rendered inline so it stays viewable
+   alongside the conversation instead of only as a "Media attached" chip. */
+.message-media {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.message.user .message-media {
+  align-items: flex-end;
+}
+
+.message-media img,
+.message-media video {
+  max-width: 100%;
+  max-height: 320px;
+  width: auto;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-tertiary);
+  display: block;
+}
+
+.message-media img {
+  cursor: zoom-in;
+  object-fit: contain;
+}
+
+.message-media img:hover {
+  border-color: var(--accent-primary);
+}
+
+.message-media-caption {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
 .message-meta {
   display: flex;
   align-items: center;
@@ -1356,10 +1407,18 @@ textarea.form-input {
 
 .caption-review-image-panel {
   flex: 1;
+  /* min-width:0 lets a flex item shrink below its content width — without it the
+     textareas' intrinsic width pins the columns and the drag handles do nothing. */
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--border-primary);
   overflow: hidden;
+}
+
+/* Collapsed preview renders no drag handle beside it, so the panel carries its
+   own divider in that state. Otherwise the handle provides it. */
+.caption-review-image-panel.collapsed {
+  border-right: 1px solid var(--border-primary);
 }
 
 .caption-review-image {
@@ -1394,13 +1453,20 @@ textarea.form-input {
 
 .caption-review-edit-panel {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 
+/* The drag handles sit between the panels, so they carry the column dividers. */
+.caption-review-content > .resize-handle {
+  border-right: 1px solid var(--border-primary);
+}
+
 .caption-review-textarea {
   flex: 1;
+  width: 100%;
   padding: 16px;
   background: var(--bg-primary);
   color: var(--text-primary);

@@ -28,10 +28,12 @@ import cv2
 import base64
 import requests
 import json
+import re
 import tempfile
 import subprocess
 import mimetypes
 import asyncio
+import threading
 import os
 import yaml
 from pathlib import Path
@@ -91,10 +93,16 @@ DEFAULT_CONFIG = {
     "min_p": 0.0,
     "top_k": 20,
     "repetition_penalty": 1.0,
-    "presence_penalty": 1.5,
+    # presence/frequency are OpenAI-semantics additive penalties on a -2..2 scale.
+    # They are NOT repetition_penalty. Non-zero frequency_penalty crushes the most
+    # frequently repeated tokens first — i.e. punctuation and function words — which
+    # degenerates long outputs into comma-less run-ons. Default both to 0.0 and use
+    # repetition_penalty / min_p to control repetition instead.
+    "presence_penalty": 0.0,
     "frequency_penalty": 0.0,
     "seed": -1,
     "thought_syntax": "<think>{content}</think>",
+    "tool_call_format": "auto",
     "vram_limit": 170000,
     # TTS integration (any OpenAI-compatible TTS server, default: local supertonic+omnivoice on :8800)
     "tts_enabled": False,
@@ -731,7 +739,7 @@ class ChatRequest(BaseModel):
     min_p: float = 0.0
     top_k: int = 20
     repetition_penalty: float = 1.0
-    presence_penalty: float = 1.5
+    presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     seed: int = -1
     # Qwen3.5 thinking mode
@@ -763,6 +771,10 @@ class ChatRequest(BaseModel):
     live_observation: Optional[str] = None
     # Agentic tool use
     tools_enabled: bool = False
+    # How to read the model's tool calls: "server" trusts vLLM's --tool-call-parser
+    # only; the others recover the call from message content when that parser and
+    # the model disagree. See TOOL_CALL_FORMATS.
+    tool_call_format: str = "auto"
 
 
 class BatchCaptionRequest(BaseModel):
@@ -772,8 +784,11 @@ class BatchCaptionRequest(BaseModel):
     max_tokens: int = 4096
     temperature: float = 1.0
     top_p: float = 0.95
+    min_p: float = 0.0
     top_k: int = 20
-    presence_penalty: float = 1.5
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
     enable_thinking: bool = False
     video_fps: float = 2.0
     force_fps: bool = True
@@ -1667,6 +1682,299 @@ async def live_turn_endpoint(req: LiveTurnRequest):
         return JSONResponse({"error": str(e)[:500]}, status_code=502)
 
 
+# --- Inline tool-call parsing -------------------------------------------------
+# vLLM's --tool-call-parser is a launch flag, so swapping models normally means
+# restarting the server with a different parser. When the configured parser does
+# not match what the model emits, vLLM returns tool_calls=null and the raw call
+# markup leaks into the message content. These parsers recover the call from that
+# content so the format can be picked per-model from the UI instead.
+
+TOOL_CALL_FORMATS = ("auto", "server", "qwen3_xml", "hermes")
+
+# Openers that mean "a tool call starts here". Matching either lets the XML form
+# be recovered whether or not the model wraps it in <tool_call>.
+_TOOL_OPENERS = ("<tool_call>", "<function=")
+
+_TOOL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", re.DOTALL)
+_TOOL_FN_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)(?:</function>|$)", re.DOTALL)
+_TOOL_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>(.*?)(?:</parameter>|$)", re.DOTALL)
+
+
+def _tool_param_schema(tool_name: str) -> dict:
+    for t in CHAT_TOOLS:
+        fn = t.get("function", {})
+        if fn.get("name") == tool_name:
+            return fn.get("parameters", {}).get("properties", {}) or {}
+    return {}
+
+
+def _coerce_tool_arg(raw: str, schema: dict):
+    """XML parameter bodies are always strings; cast them to the declared type.
+
+    vLLM's own parsers do this from the tool schema. Without it, an integer
+    parameter arrives as "10" and strict tools reject it.
+    """
+    value = raw.strip()
+    kind = (schema or {}).get("type")
+    if kind in ("integer", "number", "boolean", "array", "object"):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return value
+    return value
+
+
+def _parse_xml_tool_calls(text: str) -> List[dict]:
+    """Qwen3 XML: <tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>"""
+    calls = []
+    for name, body in _TOOL_FN_RE.findall(text):
+        props = _tool_param_schema(name)
+        args = {
+            key: _coerce_tool_arg(val, props.get(key, {}))
+            for key, val in _TOOL_PARAM_RE.findall(body)
+        }
+        calls.append({"name": name, "arguments": args})
+    return calls
+
+
+def _parse_hermes_tool_calls(text: str) -> List[dict]:
+    """Hermes: <tool_call>{"name": ..., "arguments": {...}}</tool_call>"""
+    calls = []
+    for block in _TOOL_BLOCK_RE.findall(text):
+        try:
+            obj = json.loads(block)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        name = obj.get("name")
+        if not name:
+            continue
+        args = obj.get("arguments", obj.get("parameters", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                args = {}
+        calls.append({"name": name, "arguments": args if isinstance(args, dict) else {}})
+    return calls
+
+
+def parse_inline_tool_calls(text: str, fmt: str) -> List[dict]:
+    """Recover tool calls the server's parser missed. Returns OpenAI-shaped calls."""
+    if not text or fmt == "server":
+        return []
+    if fmt == "hermes":
+        parsed = _parse_hermes_tool_calls(text)
+    elif fmt == "qwen3_xml":
+        parsed = _parse_xml_tool_calls(text)
+    else:  # auto — Hermes JSON is unambiguous, so try it before the XML form
+        parsed = _parse_hermes_tool_calls(text) or _parse_xml_tool_calls(text)
+
+    return [
+        {
+            "id": f"call_{i}",
+            "type": "function",
+            "function": {"name": c["name"], "arguments": json.dumps(c["arguments"])},
+        }
+        for i, c in enumerate(parsed)
+    ]
+
+
+class _InlineToolCallFilter:
+    """Withholds inline tool-call markup from the user-visible stream.
+
+    When the model writes its call as ordinary content, streaming it verbatim
+    shows the user raw XML/JSON. Text is emitted normally until an opener appears,
+    then buffered for the parsers. A short tail is always held back so an opener
+    split across two SSE chunks is still caught.
+    """
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.pending = ""
+        self.capturing = False
+        self.captured: List[str] = []
+        self._hold = max(len(o) for o in _TOOL_OPENERS) - 1
+
+    def feed(self, text: str) -> str:
+        """Take a content delta; return the portion safe to show the user."""
+        if not self.enabled:
+            return text
+        if not text:
+            return ""
+        if self.capturing:
+            self.captured.append(text)
+            return ""
+
+        self.pending += text
+        hits = [i for i in (self.pending.find(o) for o in _TOOL_OPENERS) if i != -1]
+        if hits:
+            idx = min(hits)
+            self.capturing = True
+            emit = self.pending[:idx]
+            self.captured.append(self.pending[idx:])
+            self.pending = ""
+            return emit
+
+        if len(self.pending) <= self._hold:
+            return ""
+        emit, self.pending = self.pending[:-self._hold], self.pending[-self._hold:]
+        return emit
+
+    def flush(self) -> str:
+        """Emit whatever was held back once the round ends without a tool call."""
+        if self.capturing:
+            return ""
+        out, self.pending = self.pending, ""
+        return out
+
+    def markup(self) -> str:
+        return "".join(self.captured)
+
+
+async def _sse_payloads(url: str, payload: dict, http_request: Optional[Request] = None):
+    """POST a streaming completion and yield each SSE data payload as a string.
+
+    requests' iter_lines() is blocking, so it is pumped from a daemon thread into
+    an asyncio queue. Closing the response drops the TCP connection, which is how
+    vLLM learns to abort the request when the browser disconnects.
+    """
+    loop = asyncio.get_event_loop()
+    resp = await loop.run_in_executor(
+        None, lambda: requests.post(url, json=payload, stream=True, timeout=600)
+    )
+    resp.raise_for_status()
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _pump():
+        try:
+            for line in resp.iter_lines():
+                loop.call_soon_threadsafe(queue.put_nowait, line)
+        except Exception:
+            pass
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+
+    threading.Thread(target=_pump, daemon=True).start()
+
+    try:
+        while True:
+            if http_request is not None and await http_request.is_disconnected():
+                break
+            try:
+                line = await asyncio.wait_for(queue.get(), timeout=0.05)
+            except asyncio.TimeoutError:
+                continue
+            if line is None:
+                break
+            if not line:
+                continue
+            decoded = line.decode("utf-8") if isinstance(line, bytes) else line
+            if decoded.startswith("data: "):
+                decoded = decoded[6:]
+            if decoded == "[DONE]":
+                break
+            yield decoded
+    finally:
+        resp.close()
+
+
+async def _stream_tool_round(url: str, payload: dict, http_request: Optional[Request] = None,
+                             tool_call_format: str = "auto"):
+    """Run one streaming round of the tool-use loop.
+
+    Yields ("delta", text) for text that should reach the user immediately, then
+    exactly one ("done", {content, reasoning, tool_calls, finish_reason}) with the
+    assembled assistant message. Streaming every round — rather than buffering to
+    find out whether it contained tool calls — is what lets the final answer stream.
+    Tool-call argument fragments still have to be accumulated before they can be
+    parsed and executed.
+    """
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    tool_calls: Dict[int, dict] = {}
+    finish_reason = ""
+    think_open = False
+    inline = _InlineToolCallFilter(tool_call_format != "server")
+
+    async for decoded in _sse_payloads(url, payload, http_request):
+        try:
+            chunk = json.loads(decoded)
+        except json.JSONDecodeError:
+            continue
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue
+        choice = choices[0]
+        finish_reason = choice.get("finish_reason") or finish_reason
+        delta = choice.get("delta") or {}
+
+        # vLLM's reasoning parsers route thinking into a separate field; re-wrap it
+        # inline so the frontend regex and the thinking_logs save path keep working.
+        reasoning = delta.get("reasoning") or delta.get("reasoning_content") or ""
+        if reasoning:
+            if not think_open:
+                think_open = True
+                yield ("delta", "<think>")
+            reasoning_parts.append(reasoning)
+            yield ("delta", reasoning)
+
+        content = delta.get("content") or ""
+        if content:
+            if think_open:
+                think_open = False
+                yield ("delta", "</think>")
+            visible = inline.feed(content)
+            if visible:
+                content_parts.append(visible)
+                yield ("delta", visible)
+
+        for tc in delta.get("tool_calls") or []:
+            idx = tc.get("index", 0)
+            slot = tool_calls.setdefault(idx, {
+                "id": "", "type": "function",
+                "function": {"name": "", "arguments": ""},
+            })
+            if tc.get("id"):
+                slot["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                slot["function"]["name"] = fn["name"]
+            if fn.get("arguments"):
+                slot["function"]["arguments"] += fn["arguments"]
+
+    if think_open:
+        yield ("delta", "</think>")
+
+    tail = inline.flush()  # no tool call materialised — release the held-back text
+    if tail:
+        content_parts.append(tail)
+        yield ("delta", tail)
+
+    assembled = []
+    for idx in sorted(tool_calls):
+        tc = tool_calls[idx]
+        if not tc["id"]:
+            tc["id"] = f"call_{idx}"  # some parsers omit ids when streaming
+        assembled.append(tc)
+
+    # Only fall back to inline parsing when the server's parser found nothing.
+    inline_markup = inline.markup()
+    if not assembled and inline_markup:
+        assembled = parse_inline_tool_calls(inline_markup, tool_call_format)
+        if not assembled:
+            # Looked like a tool call but didn't parse — show it rather than eat it.
+            content_parts.append(inline_markup)
+            yield ("delta", inline_markup)
+
+    yield ("done", {
+        "content": "".join(content_parts),
+        "reasoning": "".join(reasoning_parts),
+        "tool_calls": assembled,
+        "finish_reason": finish_reason,
+    })
+
+
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest, http_request: Request):
     """Streaming chat endpoint"""
@@ -1794,6 +2102,8 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
                         "max_tokens": int(config.get("observation_max_tokens", 1024)),
                         "temperature": float(config.get("observation_temperature", 0.4)),
                         "top_p": request.top_p,
+                        "min_p": request.min_p,
+                        "repetition_penalty": request.repetition_penalty,
                         "stream": False,
                     }
                     # Match video FPS handling from main payload
@@ -1858,6 +2168,11 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
                 "temperature": request.temperature,
                 "top_p": request.top_p,
                 "top_k": request.top_k,
+                # min_p and repetition_penalty are vLLM extra sampling params. They
+                # were previously accepted from the UI and silently dropped here, so
+                # both sliders were dead.
+                "min_p": request.min_p,
+                "repetition_penalty": request.repetition_penalty,
                 "presence_penalty": request.presence_penalty,
                 "frequency_penalty": request.frequency_penalty,
             }
@@ -1877,23 +2192,78 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
                 base_payload["tools"] = CHAT_TOOLS
                 max_tool_rounds = 10  # safety limit
 
-                for _round in range(max_tool_rounds):
-                    payload = {**base_payload, "messages": api_messages, "stream": False}
-                    resp = requests.post(config["api_url"], json=payload, timeout=600)
-                    resp.raise_for_status()
-                    result = resp.json()
+                # Every round is streamed, including the final one. The old code ran
+                # each round with stream=False to find out whether it held tool calls,
+                # which meant the final answer landed in the UI as a single block —
+                # i.e. turning Tools ON silently disabled token streaming.
+                stream_rounds = config.get("stream_tool_rounds", True)
+                tool_fmt = request.tool_call_format if request.tool_call_format in TOOL_CALL_FORMATS else "auto"
 
-                    choice = result["choices"][0]
-                    message = choice["message"]
-                    finish_reason = choice.get("finish_reason", "")
+                if tool_fmt != "server":
+                    # tool_choice="none" stands the server's parser down while still
+                    # rendering the tool definitions into the prompt via the chat
+                    # template, so the model emits its native call markup and we parse
+                    # it here. This is required, not merely tidier: with the parser
+                    # engaged but mismatched (hermes against Qwen3 XML, say) vLLM
+                    # swallows the call while streaming — no tool_calls AND no content —
+                    # leaving nothing to recover.
+                    base_payload["tool_choice"] = "none"
+
+                for _round in range(max_tool_rounds):
+                    if stream_rounds:
+                        payload = {**base_payload, "messages": api_messages, "stream": True}
+                        round_result = None
+                        async for kind, item in _stream_tool_round(
+                            config["api_url"], payload, http_request, tool_fmt
+                        ):
+                            if kind == "delta":
+                                yield f"data: {json.dumps({'content': item})}\n\n"
+                            else:
+                                round_result = item
+                        if round_result is None:
+                            break  # disconnected mid-round
+                        message = {
+                            "role": "assistant",
+                            "content": round_result["content"],
+                        }
+                        if round_result["tool_calls"]:
+                            message["tool_calls"] = round_result["tool_calls"]
+                        reasoning = round_result["reasoning"]
+                        finish_reason = round_result["finish_reason"]
+                        # Deltas already reached the browser; don't re-emit them below.
+                        already_streamed = True
+                    else:
+                        # Escape hatch for vLLM tool-call parsers that don't support
+                        # streaming: set "stream_tool_rounds": false in config.json.
+                        payload = {**base_payload, "messages": api_messages, "stream": False}
+                        resp = requests.post(config["api_url"], json=payload, timeout=600)
+                        resp.raise_for_status()
+                        result = resp.json()
+                        choice = result["choices"][0]
+                        message = choice["message"]
+                        reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+                        finish_reason = choice.get("finish_reason", "")
+                        already_streamed = False
+                        # Same fallback as the streaming path: recover a tool call the
+                        # server's parser left sitting in the content.
+                        if not message.get("tool_calls"):
+                            recovered = parse_inline_tool_calls(message.get("content") or "", tool_fmt)
+                            if recovered:
+                                message["tool_calls"] = recovered
+                                opener = min(
+                                    (i for i in (message["content"].find(o) for o in _TOOL_OPENERS) if i != -1),
+                                    default=-1,
+                                )
+                                if opener >= 0:
+                                    message["content"] = message["content"][:opener]
 
                     # If the model wants to call tools
                     if finish_reason == "tool_calls" or message.get("tool_calls"):
                         # Emit any text content (and reasoning, wrapped) the model produced alongside tool calls
-                        reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
-                        tool_pre = (f"<think>{reasoning}</think>" if reasoning else "") + normalize_reasoning_channels(message.get("content") or "")
-                        if tool_pre:
-                            yield f"data: {json.dumps({'content': tool_pre})}\n\n"
+                        if not already_streamed:
+                            tool_pre = (f"<think>{reasoning}</think>" if reasoning else "") + normalize_reasoning_channels(message.get("content") or "")
+                            if tool_pre:
+                                yield f"data: {json.dumps({'content': tool_pre})}\n\n"
 
                         # Add assistant message (with tool_calls) to conversation
                         api_messages.append(message)
@@ -1925,10 +2295,10 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
 
                     # No tool calls — model produced a final text response.
                     # Re-wrap reasoning so frontend regex and thinking_logs save work.
-                    reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
                     final = (f"<think>{reasoning}</think>" if reasoning else "") + normalize_reasoning_channels(message.get("content") or "")
-                    if final:
+                    if not already_streamed and final:
                         yield f"data: {json.dumps({'content': final})}\n\n"
+                    if final:
                         _save_thinking_from_response(final)
                     yield f"data: [DONE]\n\n"
                     return  # exit generate()
@@ -2194,8 +2564,11 @@ class RecaptionRequest(BaseModel):
     max_tokens: int = 4096
     temperature: float = 1.0
     top_p: float = 0.95
+    min_p: float = 0.0
     top_k: int = 20
-    presence_penalty: float = 1.5
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
     enable_thinking: bool = False
     strip_thinking: bool = True
 
@@ -2279,8 +2652,11 @@ async def rerun_caption(req: RecaptionRequest):
             "max_tokens": req.max_tokens,
             "temperature": req.temperature,
             "top_p": req.top_p,
+            "min_p": req.min_p,
             "top_k": req.top_k,
+            "repetition_penalty": req.repetition_penalty,
             "presence_penalty": req.presence_penalty,
+            "frequency_penalty": req.frequency_penalty,
             "stream": True,
         }
         if req.enable_thinking:
@@ -2645,8 +3021,11 @@ def _caption_single_file(file_path: str, instruction: str, config: dict,        
         "max_tokens": req_max_tokens,
         "temperature": req.temperature,
         "top_p": req.top_p,
+        "min_p": req.min_p,
         "top_k": req.top_k,
+        "repetition_penalty": req.repetition_penalty,
         "presence_penalty": req.presence_penalty,
+        "frequency_penalty": req.frequency_penalty,
         "stream": False,
     }
     if req.enable_thinking:
@@ -2793,8 +3172,11 @@ class BatchRecaptionRequest(BaseModel):
     max_tokens: int = 4096
     temperature: float = 1.0
     top_p: float = 0.95
+    min_p: float = 0.0
     top_k: int = 20
-    presence_penalty: float = 1.5
+    repetition_penalty: float = 1.0
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
     enable_thinking: bool = False
     strip_thinking: bool = True
 
@@ -2889,8 +3271,11 @@ async def batch_recaption(req: BatchRecaptionRequest):
                         "max_tokens": req.max_tokens,
                         "temperature": req.temperature,
                         "top_p": req.top_p,
+                        "min_p": req.min_p,
                         "top_k": req.top_k,
+                        "repetition_penalty": req.repetition_penalty,
                         "presence_penalty": req.presence_penalty,
+                        "frequency_penalty": req.frequency_penalty,
                         "stream": False,
                     }
                     if req.enable_thinking:
