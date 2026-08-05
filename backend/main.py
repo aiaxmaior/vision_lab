@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from pydantic import BaseModel
 from PIL import Image, ImageOps
 import io
@@ -1396,6 +1396,24 @@ async def get_media_endpoint(media_id: str):
         if f.stem == media_id:
             info = get_media_info(str(f))
             return {"path": str(f), "info": info}
+    raise HTTPException(status_code=404, detail="Media not found")
+
+
+@app.get("/api/media/{media_id}/file")
+async def get_media_file(media_id: str):
+    """Serve the raw upload so the chat can render it inline.
+
+    /api/media/{id} returns JSON metadata and the thumbnail route returns base64
+    inside JSON, so neither can back an <img>/<video> src.
+
+    FileResponse rather than StreamingResponse because it honours Range requests.
+    Without that a <video> cannot seek and the browser pulls the whole file just to
+    read its metadata — several hundred MB for a long upload.
+    """
+    for f in UPLOAD_DIR.iterdir():
+        if f.stem == media_id:
+            mime = mimetypes.guess_type(str(f))[0] or "application/octet-stream"
+            return FileResponse(f, media_type=mime)
     raise HTTPException(status_code=404, detail="Media not found")
 
 

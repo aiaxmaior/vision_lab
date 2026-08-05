@@ -239,6 +239,7 @@ function App() {
   const [enableThinking, setEnableThinking] = useState(false);
   const [enableTools, setEnableTools] = useState(false);
   const [showThinking, setShowThinking] = useState(false);
+  const [showChatMedia, setShowChatMedia] = useState(true);
   const [enableTTS, setEnableTTS] = useState(false);
   const [enableObservationPass, setEnableObservationPass] = useState(false);
   const [showObservation, setShowObservation] = useState(true);
@@ -3357,12 +3358,12 @@ function App() {
             ) : (
               messages.map((msg, i) => (
                 <div key={i} className={`message ${msg.role}${msg.autonomous ? ' autonomous' : ''}`}>
-                  {(msg.mediaId || msg.screenshot) && (
+                  {showChatMedia && (msg.mediaId || msg.screenshot) && (
                     <div className="message-media">
                       {msg.mediaId && (
                         msg.mediaType === 'video' ? (
                           <video
-                            src={`/api/media/${msg.mediaId}`}
+                            src={`/api/media/${msg.mediaId}/file`}
                             controls
                             preload="metadata"
                             // The upload can be deleted after the turn; drop the
@@ -3371,10 +3372,10 @@ function App() {
                           />
                         ) : (
                           <img
-                            src={`/api/media/${msg.mediaId}`}
+                            src={`/api/media/${msg.mediaId}/file`}
                             alt="Attached media"
                             title="Click to open full size"
-                            onClick={() => window.open(`/api/media/${msg.mediaId}`, '_blank')}
+                            onClick={() => window.open(`/api/media/${msg.mediaId}/file`, '_blank')}
                             onError={(e) => { e.currentTarget.style.display = 'none'; }}
                           />
                         )
@@ -3572,6 +3573,13 @@ function App() {
                     title="Show thinking/reasoning text in chat messages"
                   >
                     <Brain size={12} /> {showThinking ? 'Thinking Visible' : 'Show Thinking'}
+                  </button>
+                  <button
+                    className={`context-toggle ${showChatMedia ? 'active' : ''}`}
+                    onClick={() => setShowChatMedia(m => !m)}
+                    title="Render attached images/video and screenshots inline in the chat"
+                  >
+                    <ImageIcon size={12} /> {showChatMedia ? 'Media Visible' : 'Show Media'}
                   </button>
                   <button
                     className={`context-toggle ${enableTTS ? 'active' : ''}`}
