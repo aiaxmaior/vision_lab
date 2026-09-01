@@ -208,13 +208,15 @@ DEFAULT_CONFIG = {
     "observation_max_tokens": 1024,
     "observation_temperature": 0.4,
     "observation_include_media_in_pass_b": True,  # if False, pass B sees only the observation text, not the media (cheaper)
+    "effort_level": "xhigh",
     # --- Agentic web tools (web_search / fetch_url) ---
     "search_provider": "duckduckgo",   # "duckduckgo" | "searxng" | "tavily" | "brave"
     "search_max_results": 5,
     "searxng_url": "",                 # e.g. http://localhost:8888  (SearXNG instance with JSON API enabled)
     "tavily_api_key": "",
     "brave_api_key": "",
-    "fetch_url_max_chars": 8000        # cap on fetch_url text length to protect context budget
+    "fetch_url_max_chars": 8000,        # cap on fetch_url text length to protect context budget
+
 }
 
 
@@ -387,6 +389,23 @@ CHAT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "run_shell_command",
+            "description": "Run a shell command and return the output. Use this to execute system commands.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to run"
+                    }
+                },
+                "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_file",
             "description": "Write or overwrite the contents of a text file. Use this to update captions, save corrections, or create new text files.",
             "parameters": {
@@ -486,7 +505,7 @@ CHAT_TOOLS = [
 # Allowed base directories for tool file operations (safety constraint)
 TOOL_ALLOWED_PATHS = [
     Path("/media/ajax/AI"),
-    Path("/home/ajax"),
+#    Path("/home/ajax"),
 ]
 
 
@@ -650,6 +669,125 @@ def describe_media_file(media_path: str, config: dict) -> dict:
         return {"error": str(e)[:500]}
 
 
+VIDEO_DIGEST_INSTRUCTION = (
+    "You are compressing a video into a durable note that must survive after the "
+    "video itself leaves the context window. Reply with at most five short lines:\n"
+    "1. One sentence on what the video shows overall.\n"
+    "2-4. The key moments, each as 'mm:ss - what happens'.\n"
+    "5. Any visible text, labels, or identifiers worth recalling verbatim.\n"
+    "Describe only what is visible. Do not speculate. Output only those lines."
+)
+
+DIGEST_DIR = UPLOAD_DIR / "_digests"
+
+
+def _video_digest(media_path: str, media_id: str, config: dict) -> str:
+    """One-off text digest of a video, cached on disk by media_id.
+
+    Computed lazily the first time a video falls out of the replay window, so
+    videos that are never referenced again cost nothing. `_upload_paths()` walks
+    UPLOAD_DIR for files only, so this subdirectory stays invisible to it.
+    """
+    DIGEST_DIR.mkdir(exist_ok=True)
+    cached = DIGEST_DIR / f"{media_id}.txt"
+    if cached.exists():
+        try:
+            return cached.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+    try:
+        frames = prepare_media_content(
+            media_path, "", "interval", 2.0, 1.0, 8, 640, 480, "Native Resolution",
+        )
+        if not frames:
+            return ""
+        resp = requests.post(config["api_url"], json={
+            "model": config["model_name"],
+            "messages": [
+                {"role": "system", "content": VIDEO_DIGEST_INSTRUCTION},
+                {"role": "user", "content": [{"type": "text", "text": "Digest this video."}] + frames},
+            ],
+            "max_tokens": 400,
+            "temperature": 0.3,
+            "stream": False,
+        }, timeout=180)
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"].get("content", "") or ""
+        text = strip_thinking_from_content(raw).strip()
+        if text:
+            try:
+                cached.write_text(text, encoding="utf-8")
+            except OSError:
+                pass
+        return text
+    except Exception as e:
+        print(f"[digest] failed for {media_id}: {str(e)[:200]}")
+        return ""
+
+
+def _extract_keyframes(video_path: str, n: int, size: tuple = (640, 480)) -> List[str]:
+    """N evenly-spaced frames spanning the whole video, as base64 JPEGs.
+
+    extract_frames_manual reads sequentially and stops at max_frames, so asking
+    it for 3 frames returns the first three sampled — the opening moment, not a
+    summary. This seeks instead, so the frames actually span the runtime.
+    """
+    if n <= 0:
+        return []
+    cap = cv2.VideoCapture(video_path)
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
+            return []
+        # Sample at the midpoints of n equal slices, so we never land on a black
+        # first frame or a truncated last one.
+        targets = [int(total * (2 * k + 1) / (2 * n)) for k in range(n)]
+        out = []
+        for idx in targets:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, min(idx, total - 1))
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            resized = cv2.resize(frame, (int(size[0]), int(size[1])))
+            _, buf = cv2.imencode(".jpg", resized, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            out.append(base64.b64encode(buf).decode("utf-8"))
+        return out
+    finally:
+        cap.release()
+
+
+def _video_fallback_content(media_path: str, media_id: str, config: dict,
+                            n_frames: int) -> List[dict]:
+    """Degraded stand-in for a video that is out of the replay budget.
+
+    A few evenly-spaced keyframes give the model something real to look at, and
+    the cached digest carries the temporal detail that stills cannot. Either half
+    may come back empty; whatever survives is better than the bare note.
+    """
+    out: List[dict] = []
+    try:
+        for b64 in _extract_keyframes(media_path, n_frames):
+            out.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            })
+    except Exception as e:
+        print(f"[fallback] keyframes failed for {media_id}: {str(e)[:200]}")
+
+    digest = _video_digest(media_path, media_id, config)
+    label = (
+        "[The full video is no longer in the visual context window. "
+        f"{'Above are ' + str(len(out)) + ' sampled keyframes. ' if out else ''}"
+        "Summary recorded while it was visible:]\n" + digest
+    ) if digest else (
+        "[The full video is no longer in the visual context window"
+        + (f"; above are {len(out)} sampled keyframes.]" if out else
+           ". Ask the user to re-attach it if you need to look at it again.]")
+    )
+    out.append({"type": "text", "text": label})
+    return out
+
+
 def execute_tool(name: str, arguments: dict, config: Optional[dict] = None) -> dict:
     """Execute a tool call and return the result."""
     config = config or {}
@@ -716,6 +854,21 @@ def execute_tool(name: str, arguments: dict, config: Optional[dict] = None) -> d
     elif name == "fetch_url":
         return _fetch_url(arguments.get("url", ""), config)
 
+    elif name == "run_shell_command":
+        command = arguments.get("command", "")
+        if not command:
+            return {"error": "No command provided"}
+        try:
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+            return {
+                "command": command,
+                "returncode": result.returncode,
+                "stdout": result.stdout.strip(),
+                "stderr": result.stderr.strip()
+            }
+        except Exception as e:
+            return {"error": f"Failed to run command: {e}"}
+
     return {"error": f"Unknown tool: {name}"}
 
 
@@ -726,6 +879,10 @@ CUSTOM_INSTRUCTIONS = load_custom_instructions()
 class ChatMessage(BaseModel):
     role: str
     content: Any  # Can be string or list for multimodal
+    # Upload attached to this turn. Lets the backend re-attach the image on later
+    # turns so the model can look at it again instead of only ever seeing it on
+    # the turn it arrived in.
+    media_id: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -742,6 +899,16 @@ class ChatRequest(BaseModel):
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     seed: int = -1
+    # How many turns' images stay in the visual context window (most recent win).
+    max_images_in_context: int = 3
+    # Videos get their own budget: in Native Video mode a past video replays as a
+    # single video_url block, but vLLM expands it server-side, so its token cost
+    # is unlike an image's and counting it against max_images_in_context would
+    # badly under-count. 0 disables video replay entirely.
+    max_videos_in_context: int = 1
+    # Videos past that budget degrade instead of vanishing: a few keyframes plus a
+    # cached one-off text digest. 0 frames falls back to the digest alone.
+    video_fallback_frames: int = 3
     # Qwen3.5 thinking mode
     enable_thinking: bool = False
     # Two-pass observation override (per-request; falls back to config.json default)
@@ -1232,6 +1399,69 @@ async def list_prompt_profiles():
     return {"profiles": profiles}
 
 
+def _vllm_base() -> str:
+    """Origin of the vLLM server, derived from the configured chat endpoint."""
+    return load_config()["api_url"].split("/v1/")[0]
+
+
+@app.get("/api/sleep-status")
+async def sleep_status():
+    """Whether the model is currently offloaded, plus free VRAM for display.
+
+    Requires the server to be started with --enable-sleep-mode and
+    VLLM_SERVER_DEV_MODE=1; without both, /is_sleeping 404s and the UI should
+    hide the toggle rather than offer a control that cannot work.
+    """
+    try:
+        r = requests.get(f"{_vllm_base()}/is_sleeping", timeout=5)
+        if r.status_code == 404:
+            return {"available": False, "reason": "sleep mode not enabled on this server"}
+        r.raise_for_status()
+        sleeping = bool(r.json().get("is_sleeping"))
+    except Exception as e:
+        return {"available": False, "reason": str(e)[:200]}
+
+    free_gb = None
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            free_gb = round(sum(int(x) for x in out.stdout.split()) / 1024, 1)
+    except Exception:
+        pass
+    return {"available": True, "is_sleeping": sleeping, "free_vram_gb": free_gb}
+
+
+@app.post("/api/sleep")
+async def sleep_model(level: int = Query(1, ge=1, le=2)):
+    """Offload the model so other workloads can use the GPU.
+
+    Level 1 moves weights to CPU RAM — wake is fast, but the host must hold the
+    weights. Level 2 discards them and reloads from disk on wake: frees RAM too,
+    but waking costs a full load. Level 1 is the right default for flipping back
+    and forth with e.g. Diffusion work.
+    """
+    try:
+        r = requests.post(f"{_vllm_base()}/sleep", params={"level": level}, timeout=120)
+        r.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"sleep failed: {str(e)[:300]}")
+    return await sleep_status()
+
+
+@app.post("/api/wake")
+async def wake_model():
+    """Bring the model back onto the GPU. Level-2 sleeps reload from disk."""
+    try:
+        r = requests.post(f"{_vllm_base()}/wake_up", timeout=600)
+        r.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"wake failed: {str(e)[:300]}")
+    return await sleep_status()
+
+
 @app.get("/api/prompt-profiles/{filename}")
 async def load_prompt_profile(filename: str):
     """Load a specific prompt profile."""
@@ -1397,6 +1627,18 @@ async def get_media_endpoint(media_id: str):
             info = get_media_info(str(f))
             return {"path": str(f), "info": info}
     raise HTTPException(status_code=404, detail="Media not found")
+
+
+def _upload_paths() -> Dict[str, Path]:
+    """media_id -> uploaded file, built once per request.
+
+    UPLOAD_DIR accumulates hundreds of files, so resolving ids one at a time by
+    rescanning the directory is quadratic over a long conversation.
+    """
+    try:
+        return {f.stem: f for f in UPLOAD_DIR.iterdir() if f.is_file()}
+    except OSError:
+        return {}
 
 
 @app.get("/api/media/{media_id}/file")
@@ -2020,11 +2262,80 @@ async def chat_endpoint(request: ChatRequest, http_request: Request):
                 if system_msg:
                     api_messages.append({"role": "system", "content": system_msg})
             
+            # Re-attach uploads from earlier turns. Previously an upload only reached
+            # the model on the turn it was sent — history was rebuilt as plain text —
+            # so any follow-up question about the image had nothing to look at and the
+            # model would go hunting for a picture that wasn't in its context.
+            # max_images_in_context bounds the replay, most recent kept; the current
+            # turn's own media counts against that budget.
+            uploads = _upload_paths()
+            current_turn_images = 1 if (request.include_media and request.media_path) else 0
+            history_budget = max(0, request.max_images_in_context - current_turn_images)
+
+            # Images and video are budgeted separately. In Native Video mode a past
+            # video replays as one video_url block that vLLM expands server-side, so
+            # its cost is nothing like an image's and sharing a budget would
+            # under-count it badly. In frame-sample mode each frame is its own
+            # base64 block, so replay stays off and video degrades instead.
+            native_video = "Native Video" in (request.processing_mode or "")
+            img_idx, vid_idx = [], []
+            for i, m in enumerate(request.messages):
+                if not (m.media_id and m.media_id in uploads):
+                    continue
+                (vid_idx if is_video_file(str(uploads[m.media_id])) else img_idx).append(i)
+
+            keep_media = set(img_idx[-history_budget:]) if history_budget else set()
+            video_budget = request.max_videos_in_context if native_video else 0
+            keep_video = set(vid_idx[-video_budget:]) if video_budget else set()
+            keep_media |= keep_video
+            # Videos that missed the cut still leave a trace rather than vanishing.
+            degrade_video = set(vid_idx) - keep_video
+
             # Process messages, stripping thinking blocks from assistant history
-            for msg in request.messages:
+            for i, msg in enumerate(request.messages):
                 content = msg.content
                 if msg.role == "assistant" and isinstance(content, str):
                     content = strip_thinking_from_content(content)
+
+                if msg.media_id:
+                    if i in keep_media:
+                        replay = prepare_media_content(
+                            str(uploads[msg.media_id]),
+                            request.processing_mode,
+                            request.sampling_mode,
+                            request.interval,
+                            request.target_fps,
+                            request.max_frames_limit,
+                            request.image_width,
+                            request.image_height,
+                            request.resolution_mode,
+                        )
+                        if isinstance(content, str):
+                            content = ([{"type": "text", "text": content}] if content else []) + replay
+                        elif isinstance(content, list):
+                            content = content + replay
+                    elif i in degrade_video:
+                        # Keyframes plus a cached digest, so a video that has aged out
+                        # can still be referred back to instead of becoming a dead end.
+                        replay = _video_fallback_content(
+                            str(uploads[msg.media_id]), msg.media_id, config,
+                            request.video_fallback_frames,
+                        )
+                        if isinstance(content, str):
+                            content = ([{"type": "text", "text": content}] if content else []) + replay
+                        elif isinstance(content, list):
+                            content = content + replay
+                    else:
+                        # Say so, rather than leaving the model to search for an image
+                        # that has silently dropped out of the window.
+                        note = ("[Media was attached to this turn but is no longer in the "
+                                "visual context window. Ask the user to re-attach it if you "
+                                "need to look at it again.]")
+                        if isinstance(content, str):
+                            content = f"{content}\n\n{note}" if content else note
+                        elif isinstance(content, list):
+                            content = content + [{"type": "text", "text": note}]
+
                 api_messages.append({"role": msg.role, "content": content})
             
             # Add media to the last user message if requested

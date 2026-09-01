@@ -213,6 +213,9 @@ const stripToolTrace = (content: string): string =>
 const toApiMessage = (m: Message) => ({
   role: m.role,
   content: m.role === 'assistant' ? stripToolTrace(m.content || '') : m.content,
+  // Lets the backend re-attach the upload on later turns, bounded by
+  // max_images_in_context, so the model can revisit the image.
+  media_id: m.mediaId,
 });
 
 function App() {
@@ -232,6 +235,56 @@ function App() {
   const [models, setModels] = useState<string[]>([]);
   const [maxModelLen, setMaxModelLen] = useState<number | null>(null);
   const [connectionStatus, setConnectionStatus] = useState<'connected' | 'offline'>('offline');
+  // vLLM sleep mode: offloads weights to CPU RAM so the GPUs are free for other
+  // work (Diffusion, training) without tearing the server down. Requires the
+  // server to be launched with --enable-sleep-mode and VLLM_SERVER_DEV_MODE=1;
+  // when it isn't, sleepAvailable stays false and the control is hidden.
+  const [sleepAvailable, setSleepAvailable] = useState(false);
+  const [isSleeping, setIsSleeping] = useState(false);
+  const [sleepBusy, setSleepBusy] = useState(false);
+  const [freeVram, setFreeVram] = useState<number | null>(null);
+
+  const refreshSleepStatus = async () => {
+    try {
+      const r = await fetch('/api/sleep-status');
+      const d = await r.json();
+      setSleepAvailable(!!d.available);
+      setIsSleeping(!!d.is_sleeping);
+      setFreeVram(d.free_vram_gb ?? null);
+    } catch {
+      setSleepAvailable(false);
+    }
+  };
+
+  const toggleSleep = async () => {
+    if (sleepBusy) return;
+    setSleepBusy(true);
+    try {
+      // Waking a level-1 sleep is quick; a level-2 sleep reloads from disk, so
+      // allow generous time rather than leaving the UI stuck mid-flip.
+      const r = await fetch(isSleeping ? '/api/wake' : '/api/sleep?level=1', { method: 'POST' });
+      if (!r.ok) {
+        const detail = await r.text();
+        console.error('sleep toggle failed:', detail);
+        await refreshSleepStatus();
+        return;
+      }
+      const d = await r.json();
+      setIsSleeping(!!d.is_sleeping);
+      setFreeVram(d.free_vram_gb ?? null);
+    } catch (e) {
+      console.error('sleep toggle failed:', e);
+      await refreshSleepStatus();
+    } finally {
+      setSleepBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    refreshSleepStatus();
+    const t = setInterval(refreshSleepStatus, 15000);
+    return () => clearInterval(t);
+  }, []);
 
   // Tab state - left pane functions (chat is always visible on right)
   const [activeTab, setActiveTab] = useState<'captions' | 'batch' | 'prompts' | 'batch-review' | 'ui-prompts'>('batch');
@@ -694,6 +747,7 @@ function App() {
           presence_penalty: config.presence_penalty,
           frequency_penalty: config.frequency_penalty,
           seed: config.seed,
+          max_images_in_context: config.max_images_in_context,
           enable_thinking: enableThinking,
           enable_observation_pass: enableObservationPass,
           interaction_mode: config.interaction_mode,
@@ -865,17 +919,18 @@ function App() {
     if (includeMedia && media) setLastSentMedia(media.id);
 
     // Build API messages - for messages with screenshots, use multimodal content format
-    const apiMessages: { role: string; content: any }[] = messages.map(m => {
+    const apiMessages: { role: string; content: any; media_id?: string }[] = messages.map(m => {
+      const base = toApiMessage(m);
       if (m.screenshot) {
         return {
-          role: m.role,
+          ...base,
           content: [
             { type: 'image_url', image_url: { url: m.screenshot } },
-            { type: 'text', text: toApiMessage(m).content },
+            { type: 'text', text: base.content },
           ],
         };
       }
-      return toApiMessage(m);
+      return base;
     });
 
     if (hasScreenshot) {
@@ -3295,6 +3350,36 @@ function App() {
             <div className="chat-status">
               <span className={`chat-status-dot ${connectionStatus}`} />
               {connectionStatus === 'connected' ? 'Connected' : 'Offline'}
+              {sleepAvailable && (
+                <button
+                  onClick={toggleSleep}
+                  disabled={sleepBusy}
+                  title={
+                    isSleeping
+                      ? 'Model is offloaded to CPU RAM. Click to load it back onto the GPUs.'
+                      : `Offload the model to CPU RAM and free the GPUs.${freeVram !== null ? ` ${freeVram} GB free now.` : ''}`
+                  }
+                  style={{
+                    marginLeft: 10,
+                    padding: '2px 9px',
+                    fontSize: 11,
+                    borderRadius: 6,
+                    cursor: sleepBusy ? 'wait' : 'pointer',
+                    opacity: sleepBusy ? 0.6 : 1,
+                    border: '1px solid var(--border, #333)',
+                    background: isSleeping ? 'rgba(255,159,10,0.15)' : 'transparent',
+                    borderColor: isSleeping ? 'var(--warning)' : 'var(--border, #333)',
+                    color: isSleeping ? 'var(--warning)' : 'var(--text-secondary, #888)',
+                  }}
+                >
+                  {sleepBusy ? '…' : isSleeping ? '☾ Asleep — wake' : '☀ Sleep'}
+                </button>
+              )}
+              {sleepAvailable && freeVram !== null && (
+                <span style={{ marginLeft: 8, fontSize: 11, opacity: 0.6 }}>
+                  {freeVram} GB free
+                </span>
+              )}
             </div>
           </div>
 
